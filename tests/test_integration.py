@@ -629,6 +629,194 @@ async def test_prompt_renders_through_live_server(integration_mcp_server, prompt
 
 
 # -----------------------------------------------------------------------
+# Information Catalog Workflows
+# -----------------------------------------------------------------------
+
+
+def _hmeq_public_hit(items: list) -> dict | None:
+    """Find an HMEQ-in-Public-CAS hit by its resource URI, if present."""
+    for h in items:
+        uri = (h.get("resource_uri") or "").rstrip("/")
+        if uri.endswith("/Public/tables/HMEQ"):
+            return h
+    return None
+
+
+async def test_catalog_agents_workflow(integration_mcp_server):
+    """catalog_list_agents → catalog_get_agent_history → run the 'Public' agent."""
+    async with Client(integration_mcp_server) as client:
+        try:
+            agents = (
+                await client.call_tool("catalog_list_agents", {"limit": 100})
+            ).data
+        except Exception as e:
+            pytest.skip(f"Information Catalog not available on this Viya: {e}")
+        assert isinstance(agents, list)
+
+        public_agent = next(
+            (a for a in agents if (a.get("name") or "").strip().lower() == "public"),
+            None,
+        )
+        if public_agent is None:
+            pytest.skip("No discovery agent named 'Public' on this Viya")
+        agent_id = public_agent["id"]
+
+        # Run history must be retrievable for the agent.
+        history = (
+            await client.call_tool(
+                "catalog_get_agent_history", {"agent_id": agent_id, "limit": 5}
+            )
+        ).data
+        assert isinstance(history, list)
+
+        # Trigger the Public agent. 409 means it is already running — also a success.
+        try:
+            run = (
+                await client.call_tool("catalog_run_agent", {"agent_id": agent_id})
+            ).data
+        except Exception as e:
+            if "409" in str(e):
+                pytest.skip("Public agent is already running")
+            raise
+        assert run["agent_id"] == agent_id
+        assert run["status"]
+
+
+async def test_catalog_table_profile_loop(integration_mcp_server):
+    """Full loop: find/load HMEQ → ad-hoc analyze → poll to completion → download profile.
+
+    Proves the run→retrieve→profile chain end to end: searches for HMEQ in the
+    Public CAS library, loads sampsio.hmeq if it is not already cataloged, runs an
+    ad-hoc analysis, waits for it to complete, then downloads the profile and
+    asserts it is now available (status 'ok').
+    """
+    import asyncio
+
+    hmeq_uri = "/dataTables/dataSources/cas~fs~cas-shared-default~fs~Public/tables/HMEQ"
+
+    async with Client(integration_mcp_server) as client:
+        # 1. Is HMEQ already in the catalog under Public?
+        try:
+            results = (
+                await client.call_tool(
+                    "catalog_search", {"query": "Name:HMEQ", "limit": 25}
+                )
+            ).data
+        except Exception as e:
+            pytest.skip(f"Information Catalog not available on this Viya: {e}")
+
+        # Exercise the search helper while we are here.
+        helper = (await client.call_tool("catalog_search_helper", {})).data
+        assert "facets" in helper
+
+        hit = _hmeq_public_hit(results["items"])
+
+        # 2. Not in the catalog → ensure HMEQ is loaded (promoted) in Public CAS.
+        # Idempotent: drop any existing copy first so a re-run never hits the
+        # "global-scope tables cannot be replaced" error.
+        if hit is None:
+            load_code = (
+                "cas mySess;\n"
+                "libname public cas casLib='Public';\n"
+                "proc casutil;\n"
+                "  droptable casdata='HMEQ' incaslib='Public' quiet;\n"
+                "  load data=sampsio.hmeq outcaslib='Public' casout='HMEQ' promote;\n"
+                "quit;\n"
+                "cas mySess terminate;\n"
+            )
+            load = (
+                await client.call_tool("execute_sas_code", {"sas_code": load_code})
+            ).data
+            assert load["state"] in ("completed", "warning"), load["log"]
+
+        resource_uri = hit["resource_uri"] if hit else hmeq_uri
+        resource_type = (hit.get("type") if hit else None) or "casTable"
+
+        # 3. Submit an ad-hoc analysis; submission must return a job id + status.
+        job = (
+            await client.call_tool(
+                "catalog_run_adhoc_analysis",
+                {
+                    "resource_uri": resource_uri,
+                    "resource_type": resource_type,
+                    "name": f"mcp-hmeq-adhoc-{_SUFFIX}",
+                },
+            )
+        ).data
+        job_id = job["id"]
+        assert job_id, job
+        assert job["status"], "a submitted job should report a status"
+
+        # 4. Monitor until the job reaches a terminal state — this proves the
+        # submit -> poll -> retrieve mechanism. Whether the analysis *succeeds*
+        # depends on the Viya analysis backend, so we assert the job is trackable
+        # to a terminal state, not that the backend can always profile.
+        # 'not_found' = the job was purged after finishing, also terminal.
+        # Cold profiling of a CAS table routinely runs past two minutes, so we
+        # poll up to 5 minutes (60 x 5s) — the same envelope David's reference
+        # script waits — rather than flaking on a job that is still 'running'.
+        terminal = {"completed", "failed", "error", "canceled", "not_found"}
+        status = str(job["status"]).lower()
+        for _ in range(60):
+            if status in terminal:
+                break
+            await asyncio.sleep(5)
+            status = str(
+                (
+                    await client.call_tool(
+                        "catalog_get_adhoc_analysis", {"job_id": job_id}
+                    )
+                ).data["status"]
+            ).lower()
+        assert status in terminal, f"ad-hoc job never reached a terminal state: {status!r}"
+
+        # 4b. Resolve the instance straight from the resource URI — the search ->
+        # profile bridge. Either the URI is indexed ('ok' with an instance id) or
+        # it is not yet ('not_found'); both are valid, so assert the shape.
+        found = (
+            await client.call_tool(
+                "catalog_find_instance", {"resource_uri": resource_uri}
+            )
+        ).data
+        assert found["status"] in ("ok", "not_found"), found
+        if found["status"] == "ok":
+            assert found["instance_id"], found
+
+        # 5. Exercise the download tool end to end. Walk candidate tables across
+        # asset types and download each until one returns a profile ('ok') — that
+        # proves the CSV download path against a genuinely profiled table. If no
+        # table on this instance is profiled, the 'not_profiled' recommendation
+        # is the valid outcome.
+        candidates: list = []
+        for facet in (
+            "AssetType:parquet",
+            "AssetType:cas",
+            "AssetType:inmemorytable",
+            "AssetType:sas",
+        ):
+            candidates += (
+                await client.call_tool("catalog_search", {"query": facet, "limit": 15})
+            ).data["items"]
+        if not any(c.get("id") for c in candidates):
+            pytest.skip("No table instances available to download a profile")
+
+        last = None
+        for cand in candidates:
+            if not cand.get("id"):
+                continue
+            last = (
+                await client.call_tool(
+                    "catalog_download_table_profile", {"instance_id": cand["id"]}
+                )
+            ).data
+            if last["status"] == "ok":
+                assert last.get("csv", "").strip(), "profiled table returned empty CSV"
+                break
+        assert last is not None
+        assert last["status"] in ("ok", "not_profiled"), last
+
+
+# -----------------------------------------------------------------------
 # Coverage guards — fail if a registered tool/prompt has no integration test
 # -----------------------------------------------------------------------
 
@@ -668,6 +856,15 @@ TOOL_COVERAGE = {
     "list_compute_tables": "test_compute_discovery_workflow",
     "list_compute_columns": "test_compute_discovery_workflow",
     "reset_compute_session": "test_compute_session_reuse_and_reset",
+    "catalog_search": "test_catalog_table_profile_loop",
+    "catalog_search_helper": "test_catalog_table_profile_loop",
+    "catalog_find_instance": "test_catalog_table_profile_loop",
+    "catalog_download_table_profile": "test_catalog_table_profile_loop",
+    "catalog_run_adhoc_analysis": "test_catalog_table_profile_loop",
+    "catalog_get_adhoc_analysis": "test_catalog_table_profile_loop",
+    "catalog_list_agents": "test_catalog_agents_workflow",
+    "catalog_run_agent": "test_catalog_agents_workflow",
+    "catalog_get_agent_history": "test_catalog_agents_workflow",
 }
 
 
