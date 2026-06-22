@@ -9,12 +9,14 @@ All tools are registered via ``register_tools(mcp, get_token)``.
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
 from fastmcp import Context, FastMCP
 
-from .config import CONTEXT_NAME, VIYA_ENDPOINT
+from .config import CONTEXT_NAME, SSL_VERIFY, VIYA_ENDPOINT
+from .env import env_bool
 from .viya_client import (
     delete_resource,
     get_json,
@@ -25,6 +27,141 @@ from .viya_client import (
     return_items,
 )
 from .viya_utils import get_cached_session, reset_cached_session, run_one_snippet
+
+# --- upload_data: source-format handling --------------------------------------
+# Per the casManagement ``uploadTable`` API the only accepted ``format`` values
+# are csv, xls, xlsx, sas7bdat and sashdat. We map each logical format we accept
+# to that ``format`` value (+ any fixed extra form fields). ``tsv`` is not a
+# distinct API format — it is csv with a tab ``delimiter`` — and ``xlsm`` is
+# treated as ``xlsx``.
+_FORMAT_SPECS: dict[str, dict[str, str]] = {
+    "csv": {"format": "csv"},
+    "tsv": {"format": "csv", "delimiter": "\t"},  # csv with a tab delimiter
+    "xls": {"format": "xls"},
+    "xlsx": {"format": "xlsx"},
+    "xlsm": {"format": "xlsx"},
+    "sas7bdat": {"format": "sas7bdat"},
+    "sashdat": {"format": "sashdat"},
+}
+# Formats that accept a header-row flag (per the API: CSV/XLS/XLSX).
+_HEADER_FORMATS = {"csv", "tsv", "xls", "xlsx", "xlsm"}
+# Excel formats that accept a sheet name (XLS/XLSX).
+_EXCEL_FORMATS = {"xls", "xlsx", "xlsm"}
+# Binary (non-text) formats — must come from file_path/url, sent as octet-stream.
+_BINARY_FORMATS = {"xls", "xlsx", "xlsm", "sas7bdat", "sashdat"}
+# Recognized formats the upload endpoint does NOT accept. We detect these and
+# fail fast with guidance instead of a guaranteed-to-400 round-trip to Viya.
+_ENDPOINT_UNSUPPORTED = {
+    "parquet": (
+        "The casManagement file-upload endpoint does not accept parquet "
+        "(it supports csv, tsv, xls, xlsx, sas7bdat, sashdat). Load parquet via a "
+        "path-based caslib and promote_table_to_memory, or convert it to "
+        "csv/sas7bdat first."
+    ),
+}
+# File extension -> logical format, for auto-detection.
+_EXT_TO_FORMAT: dict[str, str] = {
+    ".csv": "csv",
+    ".tsv": "tsv",
+    ".tab": "tsv",
+    ".xls": "xls",
+    ".xlsx": "xlsx",
+    ".xlsm": "xlsm",
+    ".sas7bdat": "sas7bdat",
+    ".sashdat": "sashdat",
+    ".parquet": "parquet",  # recognized only to give a clear "unsupported" error
+    ".parq": "parquet",
+}
+# Friendly aliases accepted in the ``data_format`` argument.
+_FORMAT_ALIASES = {"excel": "xlsx", "tab": "tsv", "sas": "sas7bdat"}
+
+
+def _resolve_data_format(
+    data_format: str | None, file_path: str | None, url: str | None
+) -> str | None:
+    """Normalize an explicit ``data_format``, else infer from a path/URL suffix.
+
+    Returns the logical format key (a key of ``_FORMAT_SPECS``) when known, or
+    ``None`` when it can't be determined.
+    """
+    if data_format:
+        fmt = data_format.strip().lower().lstrip(".")
+        return _FORMAT_ALIASES.get(fmt, fmt)
+    ref = file_path or url
+    if ref:
+        # Drop any URL query/fragment before reading the suffix.
+        clean = ref.split("?", 1)[0].split("#", 1)[0]
+        return _EXT_TO_FORMAT.get(Path(clean).suffix.lower())
+    return None
+
+
+async def _post_cas_upload(
+    client: httpx.AsyncClient,
+    server_id: str,
+    caslib_name: str,
+    table_name: str,
+    fmt: str,
+    file_bytes: bytes,
+    source: str,
+    *,
+    sheet_name: str | None = None,
+    contains_header_row: bool = True,
+) -> dict[str, Any]:
+    """POST resolved bytes to the casManagement uploadTable endpoint, shape the result.
+
+    Shared by ``upload_data`` (file_path/url) and ``upload_inline_data`` (inline text).
+    *fmt* must already be validated against ``_FORMAT_SPECS``; *source* is echoed
+    back in the result so callers can tell how the bytes arrived.
+    """
+    spec = _FORMAT_SPECS[fmt]
+    fields: dict[str, str] = {"tableName": table_name, "format": spec["format"]}
+    if "delimiter" in spec:
+        fields["delimiter"] = spec["delimiter"]
+    if fmt in _HEADER_FORMATS:
+        fields["containsHeaderRow"] = "true" if contains_header_row else "false"
+    if sheet_name and fmt in _EXCEL_FORMATS:
+        fields["sheetName"] = sheet_name
+    content_type = "application/octet-stream" if fmt in _BINARY_FORMATS else "text/csv"
+    # The uploadTable API requires the ``file`` part to come *last*; httpx
+    # serializes ``data`` fields before ``files``, so this satisfies that.
+    resp = await client.post(
+        f"{VIYA_ENDPOINT}/casManagement/servers/{server_id}/caslibs/{caslib_name}/tables",
+        data=fields,
+        files={"file": (f"data.{fmt}", file_bytes, content_type)},
+    )
+    if resp.status_code == 409:
+        return {
+            "status": "table_already_exists",
+            "table_name": table_name,
+            "caslib": caslib_name,
+            "message": (
+                f"Table '{table_name}' already exists in caslib '{caslib_name}'. "
+                "Drop or rename before re-uploading."
+            ),
+        }
+    if resp.status_code >= 400:
+        # Surface why CAS refused (bad caslib, malformed file, scope/perm) as a
+        # structured error instead of raising an opaque one.
+        return {
+            "status": "upload_failed",
+            "http_status": resp.status_code,
+            "data_format": fmt,
+            "message": (
+                f"CAS rejected the {fmt} upload (HTTP {resp.status_code}). "
+                f"Viya said: {resp.text[:400]}"
+            ),
+        }
+    body = resp.json()
+    return {
+        "status": "success",
+        "source": source,
+        "data_format": fmt,
+        "table_name": body.get("name"),
+        "rows_uploaded": body.get("rowCount", 0),
+        "column_count": body.get("columnCount", 0),
+        "caslib": body.get("caslibName"),
+        "scope": body.get("scope"),
+    }
 
 
 def register_tools(
@@ -286,46 +423,196 @@ def register_tools(
 
     @mcp.tool()
     async def upload_data(
-        server_id: str, caslib_name: str, table_name: str, csv_data: str, ctx: Context
+        server_id: str,
+        caslib_name: str,
+        table_name: str,
+        ctx: Context,
+        file_path: str | None = None,
+        url: str | None = None,
+        data_format: str | None = None,
+        sheet_name: str | None = None,
+        contains_header_row: bool = True,
     ) -> dict[str, Any]:
-        """Upload CSV data into a CAS table.
+        """Upload a data file into a CAS table — read **by the server**, not the model.
+
+        Provide the data by reference through **exactly one** of:
+
+        * ``file_path`` — the server reads the file off its own disk (in stdio mode
+          that's your machine). Disable with ``ALLOW_LOCAL_FILE_UPLOAD=false``.
+        * ``url`` — the server fetches it over HTTP.
+
+        Either way the bytes are read server-side and never pass through the calling
+        model's context window. To create a *small* table you are building inline (no
+        file or URL), use the ``upload_inline_data`` tool instead.
+
+        The casManagement uploadTable endpoint only accepts an uploaded file (multipart
+        form-data) and has no URL parameter, so ``url`` is fetched and sent on as the
+        multipart file part.
+
+        **Formats.** Per the uploadTable API: csv, xls, xlsx (single sheet), sas7bdat,
+        sashdat; ``tsv`` is csv with a tab delimiter. parquet is **not** accepted and is
+        rejected up front with guidance (load via a path-based caslib +
+        promote_table_to_memory, or convert to csv/sas7bdat). The format is auto-detected
+        from the ``file_path``/``url`` extension; pass ``data_format`` to override (needed
+        for URLs with no clean suffix).
 
         Args:
             server_id: CAS server name or ID.
             caslib_name: Target caslib name.
             table_name: Name for the new table.
-            csv_data: CSV-formatted data string (including header row).
+            file_path: Path to a data file the server reads directly from disk.
+            url: HTTP(S) URL the server fetches the file from.
+            data_format: Override format detection. One of csv, tsv, xls, xlsx,
+                sas7bdat, sashdat (aliases: excel→xlsx, tab→tsv, sas→sas7bdat).
+            sheet_name: For Excel sources, the worksheet to import (first sheet by default).
+            contains_header_row: Whether the first row holds column names — applies
+                to csv/tsv/Excel (default True).
         """
-        async with viya_session("upload_data", ctx) as client:
-            resp = await client.post(
-                f"{VIYA_ENDPOINT}/casManagement/servers/{server_id}/caslibs/{caslib_name}/tables",
-                data={
-                    "tableName": table_name,
-                    "format": "csv",
-                    "containsHeaderRow": "true",
-                },
-                files={"file": ("data.csv", csv_data.encode("utf-8"), "text/csv")},
-            )
-            if resp.status_code == 409:
+        provided = [n for n, v in (("file_path", file_path), ("url", url)) if v]
+        if len(provided) != 1:
+            return {
+                "status": "invalid_source",
+                "provided": provided,
+                "message": (
+                    "Provide exactly one of file_path or url. To upload inline text "
+                    "use the upload_inline_data tool."
+                ),
+            }
+        source = provided[0]
+
+        # Resolve and validate the format first, so format problems fail cheaply
+        # (before any disk read, URL fetch, or Viya token/session).
+        fmt = _resolve_data_format(data_format, file_path, url)
+        if fmt is None:
+            return {
+                "status": "unknown_format",
+                "message": (
+                    "Could not infer the data format from the file/URL extension. "
+                    "Pass data_format (csv, tsv, xls, xlsx, sas7bdat, sashdat)."
+                ),
+            }
+        if fmt in _ENDPOINT_UNSUPPORTED:
+            return {
+                "status": "format_not_supported",
+                "data_format": fmt,
+                "message": _ENDPOINT_UNSUPPORTED[fmt],
+            }
+        if fmt not in _FORMAT_SPECS:
+            return {
+                "status": "unsupported_format",
+                "data_format": fmt,
+                "message": (
+                    f"Unsupported data_format '{fmt}'. Supported: "
+                    f"{', '.join(sorted(_FORMAT_SPECS))}."
+                ),
+            }
+
+        # Resolve the bytes server-side *before* touching Viya, so a bad source
+        # fails cheaply. Branch on the variables so the type checker narrows None.
+        if file_path:
+            if not env_bool("ALLOW_LOCAL_FILE_UPLOAD", True):
                 return {
-                    "status": "table_already_exists",
-                    "table_name": table_name,
-                    "caslib": caslib_name,
+                    "status": "file_upload_disabled",
                     "message": (
-                        f"Table '{table_name}' already exists in caslib "
-                        f"'{caslib_name}'. Drop or rename before re-uploading."
+                        "Server-side file reads are disabled "
+                        "(ALLOW_LOCAL_FILE_UPLOAD=false). Use url or the upload_inline_data tool."
                     ),
                 }
-            resp.raise_for_status()
-            body = resp.json()
+            path = Path(file_path).expanduser()
+            if not path.is_file():
+                return {
+                    "status": "file_not_found",
+                    "file_path": file_path,
+                    "message": (
+                        f"No readable file at '{file_path}' on the server host. In "
+                        "stdio mode that host is your local machine; pass an absolute path."
+                    ),
+                }
+            try:
+                file_bytes = path.read_bytes()
+            except OSError as exc:
+                return {
+                    "status": "file_unreadable",
+                    "file_path": file_path,
+                    "message": str(exc),
+                }
+        else:  # url — guaranteed truthy by the exactly-one-source guard above
+            assert url is not None
+            # Fetch with a plain client (no Viya bearer on an external URL).
+            try:
+                async with httpx.AsyncClient(
+                    timeout=120.0, follow_redirects=True, verify=SSL_VERIFY
+                ) as fetch_client:
+                    fetch_resp = await fetch_client.get(url)
+                    fetch_resp.raise_for_status()
+                    file_bytes = fetch_resp.content
+            except httpx.HTTPError as exc:
+                return {"status": "fetch_failed", "url": url, "message": str(exc)}
+
+        async with viya_session("upload_data", ctx) as client:
+            return await _post_cas_upload(
+                client,
+                server_id,
+                caslib_name,
+                table_name,
+                fmt,
+                file_bytes,
+                source,
+                sheet_name=sheet_name,
+                contains_header_row=contains_header_row,
+            )
+
+    @mcp.tool()
+    async def upload_inline_data(
+        server_id: str,
+        caslib_name: str,
+        table_name: str,
+        data: str,
+        ctx: Context,
+        data_format: str = "csv",
+        contains_header_row: bool = True,
+    ) -> dict[str, Any]:
+        """Create a small CAS table from inline delimited text passed as a string.
+
+        Use this only for **tiny, hand-built tables** — a lookup/mapping table the model
+        constructs on the fly, or a quick test table — because the whole payload travels
+        through the model's context as a tool argument. For anything larger, or any file
+        you already have, use ``upload_data`` (file_path/url), which reads the bytes
+        server-side instead.
+
+        Text formats only: ``csv`` (default) or ``tsv`` (tab-separated). For binary
+        formats (Excel, sas7bdat, sashdat) use ``upload_data``.
+
+        Args:
+            server_id: CAS server name or ID.
+            caslib_name: Target caslib name.
+            table_name: Name for the new table.
+            data: The delimited text, including the header row.
+            data_format: 'csv' (default) or 'tsv' (alias 'tab').
+            contains_header_row: Whether the first row holds column names (default True).
+        """
+        fmt = data_format.strip().lower()
+        fmt = _FORMAT_ALIASES.get(fmt, fmt)
+        if fmt not in ("csv", "tsv"):
             return {
-                "status": "success",
-                "table_name": body.get("name"),
-                "rows_uploaded": body.get("rowCount", 0),
-                "column_count": body.get("columnCount", 0),
-                "caslib": body.get("caslibName"),
-                "scope": body.get("scope"),
+                "status": "text_only",
+                "data_format": fmt,
+                "message": (
+                    "upload_inline_data accepts only csv or tsv text. For binary formats "
+                    "(xls, xlsx, sas7bdat, sashdat) use upload_data with file_path or url."
+                ),
             }
+        async with viya_session("upload_inline_data", ctx) as client:
+            return await _post_cas_upload(
+                client,
+                server_id,
+                caslib_name,
+                table_name,
+                fmt,
+                data.encode("utf-8"),
+                "inline",
+                contains_header_row=contains_header_row,
+            )
 
     @mcp.tool()
     async def promote_table_to_memory(
