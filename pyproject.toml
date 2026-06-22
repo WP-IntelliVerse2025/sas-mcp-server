@@ -35,6 +35,9 @@ dev = [
 target-version = "py312"
 line-length = 120
 src = ["src", "tests"]
+# Reference material (API specs, course samples, scratch scripts) is not project
+# source and should not be linted.
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 # E/F: pyflakes + pycodestyle, I: isort, B: bugbear, UP: pyupgrade,
