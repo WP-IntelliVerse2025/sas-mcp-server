@@ -6,6 +6,7 @@ Shared tool registration for both HTTP and stdio MCP servers.
 All tools are registered via ``register_tools(mcp, get_token)``.
 """
 
+import base64
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -26,7 +27,6 @@ from .viya_client import (
 )
 from .viya_utils import get_cached_session, reset_cached_session, run_one_snippet
 
-import base64
 
 def register_tools(
     mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]
@@ -566,7 +566,8 @@ def register_tools(
             body = {
                 "reportObjects": reportObjects
             }
-            resp = await client.get(
+            resp = await client.request(
+                "GET",
                 f"{VIYA_ENDPOINT}/visualAnalytics/getExportedReportPackage/{report_id}/package",
                 content=json.dumps(body).encode(),
                 headers={
