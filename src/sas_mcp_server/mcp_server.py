@@ -18,9 +18,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .config import VIYA_ENDPOINT, viya_auth
+from .decision_tools import register_decision_tools
 from .exceptions import AuthenticationError
+from .id_tools import register_id_tools
 from .prompts import register_prompts
 from .tools import register_tools
+from .va_tools import InjectedArgsMiddleware, register_va_tools
 from .viya_client import logger
 from .viya_utils import shutdown_session_cache
 
@@ -67,6 +70,9 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[dict]:
 logger.info("Connecting to SAS Viya at %s", VIYA_ENDPOINT)
 mcp = FastMCP("SAS Viya Execution MCP Server", auth=viya_auth, lifespan=_lifespan)
 mcp.add_middleware(AuthMiddleware())
+# Strip WPIntelliChat's injected _-prefixed tool args (token already arrives in
+# the bearer header) and route attached upload bytes into context state.
+mcp.add_middleware(InjectedArgsMiddleware())
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -85,6 +91,23 @@ async def _http_get_token(ctx: Context) -> str:
 
 # Register all tools and prompts
 register_tools(mcp, _http_get_token)
+register_va_tools(mcp, _http_get_token)
+register_id_tools(mcp, _http_get_token)
+register_decision_tools(mcp, _http_get_token)
 register_prompts(mcp)
 
+# Primary ASGI app: streamable HTTP transport, served at /mcp.
 app = mcp.http_app()
+
+# Also expose the SSE transport (/sse stream + /messages) on the same app, for
+# clients and registries that only speak SSE (e.g. ones that reject
+# "streamable_http" as a transport type). Both transports share this single
+# FastMCP instance: the streamable app's lifespan already starts the shared
+# FastMCP lifespan that SSE relies on, and SSE needs no session manager of its
+# own — so we graft only the SSE-unique routes onto the existing app rather
+# than running a second server.
+_sse_app = mcp.http_app(transport="sse")
+_existing_paths = {getattr(r, "path", None) for r in app.routes}
+for _route in _sse_app.routes:
+    if getattr(_route, "path", None) not in _existing_paths:
+        app.router.routes.append(_route)

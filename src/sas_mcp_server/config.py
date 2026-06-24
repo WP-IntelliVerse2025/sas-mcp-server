@@ -84,7 +84,7 @@ CLIENT_ID = os.getenv("CLIENT_ID", "sas-mcp")
 HOST_PORT = int(os.getenv("HOST_PORT", "8134"))
 MCP_SIGNING_KEY = os.getenv("MCP_SIGNING_KEY", "default")
 CONTEXT_NAME = os.getenv("COMPUTE_CONTEXT_NAME", "SAS Job Execution compute context")
-MCP_BASE_URL = os.getenv("MCP_BASE_URL", f"http://localhost:{HOST_PORT}")
+MCP_BASE_URL = os.getenv("MCP_BASE_URL", "") or f"http://localhost:{HOST_PORT}"
 
 if not VIYA_ENDPOINT:
     raise ConfigError(

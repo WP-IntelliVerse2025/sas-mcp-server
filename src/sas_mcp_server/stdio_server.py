@@ -47,9 +47,12 @@ from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 
 from .config import CLIENT_ID, SSL_VERIFY, VIYA_ENDPOINT
+from .decision_tools import register_decision_tools
 from .exceptions import AuthenticationError
+from .id_tools import register_id_tools
 from .prompts import register_prompts
 from .tools import register_tools
+from .va_tools import InjectedArgsMiddleware, register_va_tools
 from .viya_client import logger
 from .viya_utils import shutdown_session_cache
 
@@ -312,7 +315,11 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[dict]:
 
 logger.info("Connecting to SAS Viya at %s", VIYA_ENDPOINT)
 mcp = FastMCP("SAS Viya Execution MCP Server", lifespan=_lifespan)
+mcp.add_middleware(InjectedArgsMiddleware())
 register_tools(mcp, _stdio_get_token)
+register_va_tools(mcp, _stdio_get_token)
+register_id_tools(mcp, _stdio_get_token)
+register_decision_tools(mcp, _stdio_get_token)
 register_prompts(mcp)
 
 
