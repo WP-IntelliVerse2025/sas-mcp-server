@@ -192,6 +192,36 @@ The server validates the token against Viya's JWKS and uses it upstream as-is, b
 - **list_compute_columns**: List the columns of a table in a SAS library
 - **reset_compute_session**: Delete the cached compute session for a context, discarding its SAS state and forcing a fresh session on the next call
 
+#### SAS Studio (Code, Flows & Data)
+- **sas_studio_run_code**: Execute arbitrary SAS code in a SAS Studio session and return the ODS HTML output (rendered inline). Reuses a session id if given, else creates one.
+- **sas_studio_create_session**: Create a new SAS Studio session and return its id for reuse by the other `sas_studio_*` tools.
+- **sas_studio_set_session**: Point the Studio tools at an existing SAS Studio session id (the workaround for zone errors on session creation).
+- **sas_studio_diagnose**: Step-by-step connectivity check (token auth, session creation, code submission, result retrieval) — call this first when a Studio tool fails.
+- **sas_studio_run_query_flow**: Run a Studio Query flow (Data Explorer style) over a library table — select/sort/filter — and return the result as an inline table.
+- **sas_studio_get_submission_result**: Retrieve the ODS HTML output and (optionally) the SAS log for a previously submitted Studio flow/code submission.
+- **sas_studio_list_libraries**: List the SAS libraries available in a Studio session.
+- **sas_studio_list_tables**: List the tables in a SAS Studio library.
+- **sas_studio_create_program_flow**: Create and permanently save a SAS Program node flow (`.flw`) to SAS content, visible in SAS Studio's file browser.
+- **sas_studio_list_content_folders**: Browse SAS Drive folders so a flow can be saved to a chosen location.
+
+#### SAS Model Manager (modelRepository)
+- **sas_model_list_repositories**: List model repositories (the default repository's `folderId` is what `sas_model_import` needs).
+- **sas_model_list**: List models in the repository (id, name, score-code type, function, …), with an optional name filter.
+- **sas_model_summary**: Aggregate model counts grouped by a field (default `scoreCodeType`).
+- **sas_model_get**: Full metadata for one model, including its content files, input/output variables, and score-code URI.
+- **sas_model_get_content**: Stream the text of one of a model's content files (e.g. `package.json` or score code).
+- **sas_model_list_variables**: List a model's input/output variables.
+- **sas_model_add_variables**: Add input/output variables to a model from explicit definitions.
+- **sas_model_add_variables_from_cas_table**: Derive a model's variables from a CAS table's columns and add them in one step (the import-model-data-variables flow); mark target column(s) as role `output`.
+- **sas_model_import**: Import a model from an attached package archive (`.zip`) into a repository folder.
+- **sas_model_list_projects**: List Model Manager projects (the items on the Projects screen).
+- **sas_model_get_project**: One project's details plus its versions.
+- **sas_model_projects_summary**: Aggregate project counts grouped by `status` or `function`.
+- **sas_model_create_project**: Create a project (the container shown under Projects); defaults to the default repository.
+- **sas_model_list_project_models**: List the models inside a project version — use this to verify a model landed in the project.
+- **sas_model_copy_model_to_project**: Copy (or move) an existing repository model into a project so it appears under Projects.
+- **sas_model_create_project_with_model**: One-shot — create a project AND copy a model into it, so the model is immediately visible under SAS Model Manager → Projects.
+
 ### Prompt Templates
 
 - **debug_sas_log**: Analyze SAS log for errors with root-cause explanations

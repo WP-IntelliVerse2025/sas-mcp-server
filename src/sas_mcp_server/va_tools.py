@@ -599,47 +599,46 @@ def _w_studio_run_query_flow(token, a):
     out_lib = a.get("output_libref", "WORK").upper()
     out_tbl = a.get("output_table", "QUERY_OUT").upper()
     session_id = a.get("studio_session_id") or sc.get_or_create_session()
-    submission = sc.submit_query_flow(
+    max_wait = a.get("max_wait_seconds", 120)
+    # Run the query as PROC SQL. The dataFlow "Query" step's JSON schema is
+    # silently ignored on some SAS Viya builds (the flow "completes" but writes
+    # no output table), so we generate the equivalent select / where / order-by
+    # as SAS code, which every build runs identically.
+    run = sc.run_query_via_sql(
         session_id=session_id, input_libref=in_lib, input_table=in_tbl,
         output_libref=out_lib, output_table=out_tbl,
         selected_columns=a.get("selected_columns") or None,
-        sort_by=a.get("sort_by") or None, filters=a.get("filters") or None)
-    submission_id = submission.get("id", "")
-    compute_job_link = None
-    for link in (submission.get("dataFlowJob", {}).get("links") or []):
-        if link.get("rel") == "alternate":
-            compute_job_link = link.get("href")
-            break
-    max_wait = a.get("max_wait_seconds", 120)
-    state = sc.wait_for_completion(session_id, submission_id,
-                                   compute_job_link=compute_job_link,
-                                   is_flow=True, max_wait=max_wait)
-    out_tables = sc.get_output_tables(session_id, submission_id)
+        sort_by=a.get("sort_by") or None, filters=a.get("filters") or None,
+        max_wait=max_wait)
+    submission_id = run["submission_id"]
+    state = run["state"]
     html_result = None
+    tdata: dict = {}
     table_errors: list[str] = []
     if "completed" in (state or "").lower():
-        candidates = []
-        for t in out_tables:
-            lib = t.get("libref", "")
-            nm = t.get("name", "")
-            if lib and nm:
-                candidates.append((lib, nm))
-        if not candidates:
-            candidates = [(out_lib, out_tbl)]
-        for tbl_libref, tbl_name in candidates:
-            try:
-                tdata = sc.get_table_rows(session_id, tbl_libref, tbl_name, limit=500)
-                if tdata.get("columns"):
-                    html_result = sc.rows_to_html(tdata, title=f"{tbl_libref}.{tbl_name}")
-                    break
-                else:
-                    table_errors.append(f"{tbl_libref}.{tbl_name}: get_table_rows returned no columns")
-            except Exception as te:
-                table_errors.append(f"{tbl_libref}.{tbl_name}: {te}")
-    result = {"submission_id": submission_id, "studio_session_id": session_id,
-              "state": state, "output_tables": out_tables, "html_result": html_result}
+        try:
+            tdata = sc.get_table_rows(session_id, out_lib, out_tbl, limit=500)
+            if tdata.get("columns"):
+                html_result = sc.rows_to_html(tdata, title=f"{out_lib}.{out_tbl}")
+            else:
+                table_errors.append(
+                    f"{out_lib}.{out_tbl}: query ran but the table has no columns")
+        except Exception as te:
+            table_errors.append(f"{out_lib}.{out_tbl}: {te}")
+    else:
+        table_errors.append(f"submission state was {state!r}, not completed")
+    result = {
+        "submission_id": submission_id, "studio_session_id": session_id,
+        "state": state, "output_table": f"{out_lib}.{out_tbl}",
+        "columns": tdata.get("columns", []), "row_count": tdata.get("total", 0),
+        "html_result": html_result, "sql": run["sql"],
+    }
+    # On failure / empty result, surface the SAS log tail to aid debugging.
     if table_errors:
         result["table_fetch_errors"] = table_errors
+        log = sc.get_log(session_id, submission_id)
+        if log:
+            result["log_tail"] = log[-3000:]
     return result
 
 
@@ -738,24 +737,80 @@ def _w_studio_list_content_folders(token, folder_uri):
 def _w_studio_create_program_flow(token, a):
     sc = _studio(token)
     session_id = a.get("studio_session_id") or sc.get_or_create_session()
-    folder_uri = a.get("folder_uri") or ""
+
+    # Resolve / normalise the target folder. SAS's parentFolderUri needs a clean
+    # '/folders/folders/{uuid}', so a 'sascontent:' prefix or an '@myFolder'
+    # alias is resolved here; a plain folder NAME (or anything else unusable) is
+    # treated as "not chosen" so we ask the user rather than guessing.
+    folder_uri = (a.get("folder_uri") or "").strip()
+    if folder_uri.startswith("sascontent:"):
+        folder_uri = folder_uri.replace("sascontent:", "", 1)
+    if folder_uri.startswith("@"):
+        try:
+            ar = sc._http.get(f"{sc.base_url}/folders/folders/{folder_uri}",
+                              headers=sc._hdrs(), timeout=8.0)
+            fid = ar.json().get("id", "") if ar.is_success else ""
+            folder_uri = f"/folders/folders/{fid}" if fid else ""
+        except Exception:
+            folder_uri = ""
+    if folder_uri and not folder_uri.startswith("/folders/folders/"):
+        folder_uri = ""
+
     if not folder_uri:
-        folder_uri = sc.get_my_folder_uri(session_id) or ""
-    if not folder_uri:
-        return ("ERROR: Could not determine a target folder. Please supply folder_uri "
-                "(e.g. '/folders/folders/{uuid}'). Use sas_studio_list_content_folders "
-                "to browse available folders.")
+        # Don't silently save to My Folder — return the folder choices + picker
+        # signal and ask the user. The flow is saved on the follow-up call once
+        # folder_uri is supplied.
+        folders = _w_studio_list_content_folders(token, None).get("folders", [])
+        return {
+            "needs_folder_selection": True,
+            "folder_picker": True,
+            "folders": folders,
+            "flow_name": a.get("flow_name", ""),
+            "studio_session_id": session_id,
+            "message": (
+                "Where would you like to save the flow in SAS? Choose a destination "
+                "folder from the list (e.g. My Folder), then I'll save it there. To "
+                "confirm, call sas_studio_create_program_flow again with the chosen "
+                "folder_uri (keeping the same flow_name and code)."),
+        }
+
+    # Resolve a human-readable folder name before saving.
     folder_name = "My Folder"
     try:
         fid = folder_uri.rstrip("/").split("/")[-1]
-        fr = sc._http.get(f"{sc.base_url}/folders/folders/{fid}", headers=sc._hdrs(), timeout=8.0)
+        fr = sc._http.get(f"{sc.base_url}/folders/folders/{fid}",
+                          headers=sc._hdrs(), timeout=8.0)
         if fr.is_success:
             folder_name = fr.json().get("name", folder_name)
     except Exception:
         pass
-    result = sc.save_sas_program_flow(
-        name=a["flow_name"], code=a["code"], folder_uri=folder_uri, session_id=session_id,
-        description=a.get("description", ""), overwrite=a.get("overwrite", True))
+
+    try:
+        result = sc.save_sas_program_flow(
+            name=a["flow_name"], code=a["code"], folder_uri=folder_uri,
+            session_id=session_id, description=a.get("description", ""),
+            overwrite=a.get("overwrite", True))
+    except PermissionError as perm_exc:
+        # SAS refused the chosen folder (403). Don't silently re-route to My
+        # Folder — report exactly what SAS said and re-offer the picker.
+        folders = _w_studio_list_content_folders(token, None).get("folders", [])
+        return {
+            "needs_folder_selection": True,
+            "folder_picker": True,
+            "save_denied": True,
+            "denied_folder": folder_name,
+            "denied_folder_uri": folder_uri,
+            "denied_reason": str(perm_exc),
+            "folders": folders,
+            "flow_name": a.get("flow_name", ""),
+            "studio_session_id": session_id,
+            "message": (
+                f"SAS would not let me save to '{folder_name}'. Reason: {perm_exc} "
+                "Please pick a different destination folder, then call "
+                "sas_studio_create_program_flow again with the new folder_uri "
+                "(keep the same flow_name and code)."),
+        }
+
     saved = result.get("saved")
     return {**result, "folder_name": folder_name, "studio_session_id": session_id,
             "message": (f"Flow '{result['name']}' saved to '{folder_name}' in SAS Drive. "
@@ -1211,12 +1266,19 @@ def register_va_tools(
 
     @mcp.tool(
         name="sas_studio_run_query_flow",
-        description=("Run a SAS Studio Query flow (Data Explorer style) on an existing SAS library "
-                     "table and show the result as an inline table. Writes the filtered/sorted "
-                     "result to a WORK output table. Does NOT save a .flw file — use "
-                     "sas_studio_create_program_flow for that. Filter operators: equals, "
-                     "notequals, lessthan, greaterthan, lessthanorequals, greaterthanorequals, "
-                     "contains, startswith."),
+        description=(
+            "Run a SAS Studio Query flow (Data Explorer style) on an existing SAS library table "
+            "and show the result as an inline table in WP Copilot chat.\n\n"
+            "IMPORTANT — what this tool does and does NOT do:\n"
+            "  ✅ Runs the query and shows the result table inline in chat.\n"
+            "  ✅ Writes the filtered/sorted result to a WORK output table.\n"
+            "  ❌ Does NOT save a .flw flow file to SAS Drive / SAS Studio file browser.\n"
+            "     → To also save a persistent .flw file, call sas_studio_create_program_flow.\n\n"
+            "Use this tool when the user asks to 'query', 'filter', 'select columns from', "
+            "or 'show data from' a SAS table. If they also ask to 'save the flow' or 'create a "
+            "reusable flow', call sas_studio_create_program_flow after this.\n\n"
+            "Filter operators: equals, notequals, lessthan, greaterthan, "
+            "lessthanorequals, greaterthanorequals, contains, startswith."),
     )
     async def sas_studio_run_query_flow(
         input_libref: str, input_table: str, ctx: Context,
@@ -1275,10 +1337,20 @@ def register_va_tools(
 
     @mcp.tool(
         name="sas_studio_create_program_flow",
-        description=("Create and permanently save a SAS Program node flow (.flw file) to the SAS "
-                     "content server, visible in SAS Studio's file browser. Embeds SAS code in a "
-                     "SAS Program node. If folder_uri is omitted, the user's My Folder is "
-                     "auto-discovered. Use sas_studio_list_content_folders to pick a folder."),
+        description=(
+            "Create and permanently save a SAS Program node flow (.flw file) to the SAS content "
+            "server, making it visible in SAS Studio's file browser. The flow embeds SAS code "
+            "inside a SAS Program node — the same as dragging a 'SAS Program' step onto the "
+            "Studio canvas and saving the flow.\n\n"
+            "WHERE TO SAVE — the tool asks first: if you call it WITHOUT folder_uri, it does "
+            "NOT save; instead it returns the list of available destination folders "
+            "(needs_folder_selection=true, folder_picker=true) so the user can choose. Present "
+            "those folders, let the user pick one, then call this tool AGAIN with the chosen "
+            "folder_uri (and the same flow_name and code) to actually save.\n\n"
+            "If SAS refuses the chosen folder (no write permission), the tool returns "
+            "save_denied=true with SAS's reason and the folder list again — report the error "
+            "and ask the user to pick a DIFFERENT folder, then retry. It never silently saves "
+            "somewhere the user didn't choose."),
     )
     async def sas_studio_create_program_flow(
         flow_name: str, code: str, ctx: Context, folder_uri: str | None = None,

@@ -21,6 +21,7 @@ from .config import VIYA_ENDPOINT, viya_auth
 from .decision_tools import register_decision_tools
 from .exceptions import AuthenticationError
 from .id_tools import register_id_tools
+from .model_tools import register_model_tools
 from .prompts import register_prompts
 from .tools import register_tools
 from .va_tools import InjectedArgsMiddleware, register_va_tools
@@ -94,6 +95,7 @@ register_tools(mcp, _http_get_token)
 register_va_tools(mcp, _http_get_token)
 register_id_tools(mcp, _http_get_token)
 register_decision_tools(mcp, _http_get_token)
+register_model_tools(mcp, _http_get_token)
 register_prompts(mcp)
 
 # Primary ASGI app: streamable HTTP transport, served at /mcp.

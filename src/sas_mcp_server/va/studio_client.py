@@ -34,6 +34,21 @@ class SASStudioClient:
         # If a session ID is pre-configured (e.g. from SAS_STUDIO_SESSION_ID env var)
         # skip session creation and reuse it directly.
         self._studio_session_id: Optional[str] = preset_session_id
+        # Compute-service backend (the zero-paste default): creating a SAS Studio
+        # session needs a `zone` value that some Viya builds don't expose via any
+        # API, so we fall back to the Compute service, which creates sessions
+        # against a compute context with no zone and no browser dependency.
+        self._compute_session_id: Optional[str] = None
+        self._compute_ctx_id: Optional[str] = None
+
+    # ── Backend discriminator ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_compute(session_id: Optional[str]) -> bool:
+        """Compute-service session IDs look like '{uuid}-ses0000'; SAS Studio
+        session IDs are plain UUIDs. This lets every method route itself to the
+        right set of endpoints without extra state."""
+        return bool(session_id) and "-ses" in session_id
 
     # ── Auth ────────────────────────────────────────────────────────────────
 
@@ -49,6 +64,219 @@ class SASStudioClient:
             h["Content-Type"] = content_type
         return h
 
+    # ── Compute backend (zero-paste default) ──────────────────────────────────
+
+    def _find_studio_compute_context(self) -> Optional[str]:
+        """Return the compute context ID used by SAS Studio.
+
+        Prefers the context literally named "SAS Studio compute context";
+        falls back to the first context whose name contains "studio", then to
+        the first context available. Cached after first lookup.
+        """
+        if self._compute_ctx_id:
+            return self._compute_ctx_id
+        try:
+            r = self._http.get(
+                f"{self.base_url}/compute/contexts",
+                headers=self._hdrs(),
+                params={"limit": 100},
+                timeout=15.0,
+            )
+            if not r.is_success:
+                return None
+            items = r.json().get("items", [])
+            exact = [i for i in items if i.get("name") == "SAS Studio compute context"]
+            studio = [i for i in items if "studio" in (i.get("name", "").lower())]
+            chosen = (exact or studio or items or [None])[0]
+            if chosen:
+                self._compute_ctx_id = chosen.get("id")
+        except Exception:
+            self._compute_ctx_id = None
+        return self._compute_ctx_id
+
+    def _compute_session_alive(self, session_id: str) -> bool:
+        try:
+            r = self._http.get(
+                f"{self.base_url}/compute/sessions/{session_id}/state",
+                headers=self._hdrs(),
+                timeout=10.0,
+            )
+            return r.is_success
+        except Exception:
+            return False
+
+    def _create_compute_session(self) -> str:
+        """Create a Compute session against the SAS Studio compute context.
+
+        No ``zone`` is required (unlike /studio/sessions), so this works on
+        builds where the Studio zone can't be discovered.
+        """
+        ctx = self._find_studio_compute_context()
+        if not ctx:
+            raise RuntimeError(
+                "No compute context available to create a SAS session. "
+                "Check that the Compute service is running and the user has "
+                "permission to launch a session."
+            )
+        r = self._http.post(
+            f"{self.base_url}/compute/contexts/{ctx}/sessions",
+            headers=self._hdrs("application/json"),
+            json={},
+            timeout=60.0,
+        )
+        if r.status_code in (401, 403):
+            raise RuntimeError(
+                f"Auth failed creating compute session (HTTP {r.status_code}): "
+                f"{r.text[:300]}"
+            )
+        if r.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Could not create compute session (HTTP {r.status_code}): "
+                f"{r.text[:300]}"
+            )
+        sid = r.json().get("id")
+        if not sid:
+            raise RuntimeError("Compute session created but no id was returned.")
+        self._compute_session_id = sid
+        return sid
+
+    def _compute_run_job(self, session_id: str, code: str) -> str:
+        """Submit SAS code as a compute job; return the job ID."""
+        r = self._http.post(
+            f"{self.base_url}/compute/sessions/{session_id}/jobs",
+            headers=self._hdrs("application/json"),
+            json={"code": [code]},
+            timeout=60.0,
+        )
+        r.raise_for_status()
+        return r.json().get("id", "")
+
+    def _compute_wait(self, session_id: str, job_id: str, max_wait: int = 120) -> str:
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            try:
+                r = self._http.get(
+                    f"{self.base_url}/compute/sessions/{session_id}/jobs/{job_id}/state",
+                    headers=self._hdrs(accept="text/plain"),
+                    timeout=15.0,
+                )
+                state = (r.text or "").strip()
+                if state in ("completed", "error", "failed", "canceled", "warning"):
+                    return state
+            except Exception:
+                pass
+            time.sleep(1)
+        return "timeout"
+
+    def _compute_get_log(self, session_id: str, job_id: str) -> str:
+        try:
+            r = self._http.get(
+                f"{self.base_url}/compute/sessions/{session_id}/jobs/{job_id}/log",
+                headers=self._hdrs(),
+                params={"limit": 100000},
+                timeout=30.0,
+            )
+            if not r.is_success:
+                return ""
+            return "\n".join(it.get("line", "") for it in r.json().get("items", []))
+        except Exception:
+            return ""
+
+    def _compute_output_tables(self, session_id: str, job_id: str) -> list:
+        """Best-effort list of tables produced by a compute job (results of
+        type TABLE), shaped like the Studio output-tables list."""
+        out: list[dict] = []
+        try:
+            r = self._http.get(
+                f"{self.base_url}/compute/sessions/{session_id}/jobs/{job_id}/results",
+                headers=self._hdrs(),
+                params={"limit": 100},
+                timeout=20.0,
+            )
+            if not r.is_success:
+                return out
+            for it in r.json().get("items", []):
+                if (it.get("type") or "").upper() != "TABLE":
+                    continue
+                href = ""
+                for ln in (it.get("links") or []):
+                    if ln.get("rel") in ("self", "up", "data"):
+                        href = ln.get("href", "")
+                        break
+                libref, name = "", it.get("name", "")
+                # href ends with /data/{LIB}/{TABLE}
+                parts = [p for p in href.split("/data/")[-1].split("/") if p]
+                if len(parts) >= 2:
+                    libref, name = parts[0], parts[1]
+                out.append({"libref": libref, "name": name})
+        except Exception:
+            pass
+        return out
+
+    def _compute_get_table_rows(self, session_id: str, libref: str,
+                                table: str, limit: int = 500) -> dict:
+        r = self._http.get(
+            f"{self.base_url}/compute/sessions/{session_id}"
+            f"/data/{libref}/{table}/rows",
+            headers=self._hdrs(),
+            params={"start": 0, "limit": limit, "includeColumnNames": "true"},
+            timeout=30.0,
+        )
+        if not r.is_success:
+            return {}
+        items = r.json().get("items", [])
+        columns: list[str] = []
+        rows: list[list] = []
+        for it in items:
+            if isinstance(it, dict) and "columns" in it:
+                columns = list(it.get("columns") or [])
+            elif isinstance(it, dict) and "cells" in it:
+                rows.append(["" if v is None else v for v in it.get("cells", [])])
+        return {"columns": columns, "rows": rows, "total": len(rows)}
+
+    def _compute_get_table_columns(self, session_id: str, libref: str,
+                                   table: str) -> list:
+        r = self._http.get(
+            f"{self.base_url}/compute/sessions/{session_id}"
+            f"/data/{libref}/{table}/columns",
+            headers=self._hdrs(),
+            params={"start": 0, "limit": 1000},
+            timeout=30.0,
+        )
+        r.raise_for_status()
+        cols = []
+        for c in r.json().get("items", []):
+            cols.append({
+                "name": c.get("name") or c.get("id", ""),
+                "type": c.get("type", ""),
+                "byteLength": c.get("byteLength", 8),
+                "charLength": c.get("charLength", -1),
+            })
+        return cols
+
+    def _compute_list_libraries(self, session_id: str) -> list:
+        r = self._http.get(
+            f"{self.base_url}/compute/sessions/{session_id}/data",
+            headers=self._hdrs(),
+            params={"limit": 200},
+            timeout=20.0,
+        )
+        r.raise_for_status()
+        return r.json().get("items", [])
+
+    def _compute_list_tables(self, session_id: str, libref: str) -> list:
+        """List tables in a library via dictionary.tables (the /data/{lib}
+        collection isn't a tables list on this build)."""
+        code = (
+            f"proc sql; create table work._mcp_tbls as "
+            f"select memname as name from dictionary.tables "
+            f"where libname=upcase('{libref}') order by memname; quit;"
+        )
+        jid = self._compute_run_job(session_id, code)
+        self._compute_wait(session_id, jid, max_wait=30)
+        data = self._compute_get_table_rows(session_id, "WORK", "_MCP_TBLS", limit=1000)
+        return [{"name": r[0]} for r in data.get("rows", []) if r]
+
     # ── Studio session ───────────────────────────────────────────────────────
 
     def _ensure_sassession(
@@ -63,7 +291,11 @@ class SASStudioClient:
         all treated as success.  Confirmed via cas_con.har:
           POST /studio/sessions/{id}/sassession  body={"serverName":"SAS Studio compute context"}
           -> 201 {"activeServer":"SAS Studio compute context","initializationState":"completed",...}
+
+        No-op for Compute sessions — they are ready to run code on creation.
         """
+        if self._is_compute(session_id):
+            return {"_status": "compute-session-ready"}
         try:
             resp = self._http.post(
                 f"{self.base_url}/studio/sessions/{session_id}/sassession",
@@ -201,16 +433,20 @@ class SASStudioClient:
         return None
 
     def get_or_create_session(self) -> str:
-        """Return a cached Studio session ID, reusing an existing one if possible.
+        """Return a usable SAS session ID, creating one automatically.
 
         Strategy (in order):
-        1. Preset SAS_STUDIO_SESSION_ID env var — fastest path.
-        2. List GET /studio/sessions and ping each for keepalive — reuse any
-           alive session without touching the zone API at all.
-        3. Create a new session, trying bodies with no zone first (let the
-           server pick the default), then discovered zone names.
+        1. An explicit, still-alive SAS Studio preset (SAS_STUDIO_SESSION_ID) —
+           honored for backward compatibility with a pasted browser session.
+        2. A previously-created Compute session that is still alive.
+        3. A freshly-created Compute session — the zero-paste default. This needs
+           no ``zone`` (unlike /studio/sessions) and no browser, so it works on
+           builds where the Studio zone cannot be discovered.
+
+        Compute session IDs look like '{uuid}-ses0000'; every other method uses
+        _is_compute() to route to the matching endpoints.
         """
-        # ── 1. Preset / cached session ────────────────────────────────────
+        # ── 1. Explicit Studio preset (only if genuinely alive) ────────────
         if self._studio_session_id:
             try:
                 ping = self._http.get(
@@ -222,63 +458,15 @@ class SASStudioClient:
                     return self._studio_session_id
             except Exception:
                 pass
+            # Preset is dead — drop it and fall through to Compute.
             self._studio_session_id = None
 
-        # ── 2. Reuse any existing alive session (avoids zone API entirely) ─
-        alive = self._find_alive_session()
-        if alive:
-            self._studio_session_id = alive
-            return alive
+        # ── 2. Reuse a live Compute session from this client ───────────────
+        if self._compute_session_id and self._compute_session_alive(self._compute_session_id):
+            return self._compute_session_id
 
-        # ── 3. Create a new session ────────────────────────────────────────
-        zones = self._discover_zone()
-        errors: list[str] = []
-
-        # Try no-zone bodies first (server picks the default context), then
-        # discovered zone names.  This matches how the SAS Studio web app
-        # behaves on a fresh browser tab when no zone is pre-selected.
-        candidate_bodies: list[dict] = [
-            {"version": 1},                    # no zone — server default
-            {"version": 1, "contextName": "SAS Studio compute context"},
-        ]
-        for zone in zones:
-            candidate_bodies.append({"version": 1, "zone": zone})
-            candidate_bodies.append({"version": 1, "zone": zone, "contextName": zone})
-
-        for body in candidate_bodies:
-            try:
-                resp = self._http.post(
-                    f"{self.base_url}/studio/sessions",
-                    headers=self._hdrs("application/json"),
-                    json=body,
-                    timeout=30.0,
-                )
-                if resp.status_code in (200, 201):
-                    data = resp.json()
-                    sid = (data.get("id") or data.get("sessionId")
-                           or data.get("sessionid"))
-                    if sid:
-                        self._studio_session_id = sid
-                        self._ensure_sassession(sid)
-                        return sid
-                if resp.status_code in (401, 403):
-                    raise RuntimeError(
-                        f"Auth failed (HTTP {resp.status_code}): {resp.text[:400]}"
-                    )
-                errors.append(
-                    f"body={list(body.keys())} "
-                    f"→ HTTP {resp.status_code}: {resp.text[:250]}"
-                )
-            except RuntimeError:
-                raise
-            except Exception as exc:
-                errors.append(f"body={list(body.keys())}: {exc}")
-
-        raise RuntimeError(
-            "Could not create a SAS Studio session.\n"
-            "Bodies tried: " + str([list(b.keys()) for b in candidate_bodies[:6]]) + "\n"
-            "Errors:\n" + "\n".join(f"  {e}" for e in errors[:8])
-        )
+        # ── 3. Create a new Compute session (no zone, no browser) ──────────
+        return self._create_compute_session()
 
     def diagnose(self) -> dict:
         """Step-by-step connectivity check — call via sas_studio_diagnose tool."""
@@ -287,162 +475,83 @@ class SASStudioClient:
         def _step(name: str, ok: bool, detail: str):
             report["steps"].append({"step": name, "ok": ok, "detail": detail})
 
-        # 0. Check the preset session from SAS_STUDIO_SESSION_ID / constructor argument.
-        #    This is the FASTEST path — if the browser session is alive, we're done here.
+        # 0. Optional Studio preset (only relevant if someone pasted one).
         preset = self._studio_session_id
         if preset:
             try:
                 ping = self._http.get(
                     f"{self.base_url}/studio/sessions/{preset}/keepalive",
-                    headers=self._hdrs(),
-                    timeout=10.0,
+                    headers=self._hdrs(), timeout=10.0,
                 )
                 ok = ping.status_code == 200
-                _step(
-                    "preset_session_keepalive",
-                    ok,
-                    f"session_id={preset} HTTP {ping.status_code}"
-                    + ("" if ok else
-                       " — session expired; get a fresh ID from browser DevTools "
-                       "(Network tab → filter 'studio/sessions' → copy UUID from URL)"),
-                )
+                _step("studio_preset_keepalive", ok,
+                      f"session_id={preset} HTTP {ping.status_code}"
+                      + ("" if ok else " (expired — will auto-use a Compute session instead)"))
                 if ok:
                     report["session_id"] = preset
+                    report["mode"] = "studio-preset"
                     report["overall_ok"] = True
-                    report["message"] = (
-                        f"Preset session {preset!r} is alive. "
-                        "All Studio tools will use this session."
-                    )
+                    report["message"] = f"Studio preset session {preset!r} is alive."
                     return report
             except Exception as e:
-                _step("preset_session_keepalive", False, str(e))
+                _step("studio_preset_keepalive", False, str(e))
         else:
-            _step("preset_session_keepalive", False,
-                  "SAS_STUDIO_SESSION_ID not set. "
-                  "Get session ID from browser DevTools: Network tab → filter "
-                  "'studio/sessions' → copy UUID from URL → run sas_studio_set_session.")
+            _step("studio_preset", True,
+                  "No SAS_STUDIO_SESSION_ID set — using the automatic Compute "
+                  "session backend (no manual session ID needed).")
 
         # 1. Auth check
         for path in ["/compute/contexts", "/identities/users/@currentUser"]:
             try:
-                r = self._http.get(
-                    f"{self.base_url}{path}",
-                    headers=self._hdrs(),
-                    params={"limit": 1},
-                    timeout=10.0,
-                )
+                r = self._http.get(f"{self.base_url}{path}", headers=self._hdrs(),
+                                   params={"limit": 1}, timeout=10.0)
                 _step(f"auth_check ({path})", r.is_success,
-                      f"HTTP {r.status_code}" + ("" if r.is_success else f" body={r.text[:300]}"))
+                      f"HTTP {r.status_code}" + ("" if r.is_success else f" body={r.text[:200]}"))
                 if r.is_success:
                     break
             except Exception as e:
                 _step(f"auth_check ({path})", False, str(e))
 
-        # 2. List existing sessions (primary recovery path — avoids zone guessing)
-        try:
-            r = self._http.get(
-                f"{self.base_url}/studio/sessions",
-                headers=self._hdrs(),
-                params={"limit": 20},
-                timeout=10.0,
-            )
-            _step("list_existing_sessions", r.is_success,
-                  f"HTTP {r.status_code} body={r.text[:500]}")
-        except Exception as e:
-            _step("list_existing_sessions", False, str(e))
+        # 2. Discover the SAS Studio compute context (the zone-free way in).
+        ctx = self._find_studio_compute_context()
+        _step("find_compute_context", bool(ctx), f"context_id={ctx}")
 
-        # 3. Probe /studio/zones directly so the raw response is visible
-        try:
-            r = self._http.get(
-                f"{self.base_url}/studio/zones",
-                headers=self._hdrs(),
-                params={"limit": 50},
-                timeout=10.0,
-            )
-            _step("studio_zones_endpoint", r.is_success,
-                  f"HTTP {r.status_code} body={r.text[:500]}")
-        except Exception as e:
-            _step("studio_zones_endpoint", False, str(e))
-
-        # Also probe /compute/providers/Compute/sources
-        try:
-            r = self._http.get(
-                f"{self.base_url}/compute/providers/Compute/sources",
-                headers=self._hdrs(),
-                params={"limit": 20},
-                timeout=10.0,
-            )
-            _step("compute_providers_sources", r.is_success,
-                  f"HTTP {r.status_code} body={r.text[:500]}")
-        except Exception as e:
-            _step("compute_providers_sources", False, str(e))
-
-        zones = self._discover_zone()
-        _step("discover_zones", True, f"zones_found={zones[:8]}")
-
-        # 4. Try session creation — no-zone first, then discovered zones
+        # 3. Auto-create a Compute session (no zone, no browser, no paste).
         session_id: Optional[str] = None
-        create_bodies = [{"version": 1}] + [{"version": 1, "zone": z} for z in zones[:4]]
-        for body in create_bodies:
-            try:
-                r = self._http.post(
-                    f"{self.base_url}/studio/sessions",
-                    headers=self._hdrs("application/json"),
-                    json=body,
-                    timeout=20.0,
-                )
-                ok = r.status_code in (200, 201)
-                label = "no-zone" if "zone" not in body else f"zone={body['zone']!r}"
-                _step(
-                    f"create_session ({label})",
-                    ok,
-                    f"HTTP {r.status_code} body={r.text[:400]}",
-                )
-                if ok:
-                    data = r.json()
-                    session_id = data.get("id") or data.get("sessionId")
-                    break
-            except Exception as e:
-                _step(f"create_session (body={list(body.keys())})", False, str(e))
+        try:
+            session_id = self._create_compute_session()
+            _step("create_compute_session", bool(session_id),
+                  f"session_id={session_id}")
+        except Exception as e:
+            _step("create_compute_session", False, str(e))
 
-        # 5. Try reusing an existing alive session if creation failed
-        if not session_id:
-            alive = self._find_alive_session()
-            if alive:
-                session_id = alive
-                _step("reuse_existing_session", True, f"session_id={alive}")
-            else:
-                _step("reuse_existing_session", False,
-                      "No alive existing session found either")
-
-        # 6. SAS session init (sassession) — must succeed before code submission
+        # 4. Run a tiny job to confirm code execution works end-to-end.
         if session_id:
             try:
-                ss = self._ensure_sassession(session_id)
-                init_state = ss.get("initializationState", ss.get("_status", "?"))
-                _step("sassession_init", "_warn" not in ss,
-                      f"initializationState={init_state} activeServer={ss.get('activeServer','')}")
-            except Exception as e:
-                _step("sassession_init", False, str(e))
-
-        # 5. Code submission test (only if a session was created)
-        if session_id:
-            try:
-                sub = self.submit_code(session_id, "%put diagnose ok;",
-                                       label="diagnose.sas")
+                sub = self.submit_code(session_id, "%put diagnose ok;")
                 sub_id = sub.get("id", "")
-                _step("submit_code", bool(sub_id), f"submission_id={sub_id}")
-                if sub_id:
-                    state = self.wait_for_completion(
-                        session_id, sub_id, is_flow=False, max_wait=30)
-                    _step("wait_completion", state != "timeout", f"state={state}")
-                    html = self.get_html_result(session_id, sub_id)
-                    _step("get_html_result", bool(html),
-                          f"html_len={len(html) if html else 0}")
+                state = self.wait_for_completion(session_id, sub_id, max_wait=30)
+                _step("run_code", state == "completed", f"state={state}")
             except Exception as e:
-                _step("submit_code", False, str(e))
+                _step("run_code", False, str(e))
 
+            # 5. Confirm the data API can read a known table.
+            try:
+                td = self.get_table_rows(session_id, "SASHELP", "CLASS", limit=1)
+                _step("read_data_api", bool(td.get("columns")),
+                      f"columns={td.get('columns')}")
+            except Exception as e:
+                _step("read_data_api", False, str(e))
+
+        report["session_id"] = session_id
+        report["mode"] = "compute"
         report["overall_ok"] = all(s["ok"] for s in report["steps"])
+        report["message"] = (
+            "SAS sessions are created automatically via the Compute service — "
+            "no manual session ID is required."
+            if report["overall_ok"] else
+            "Automatic Compute session path failed — see the failing step above."
+        )
         return report
 
     # ── Table metadata ───────────────────────────────────────────────────────
@@ -456,10 +565,20 @@ class SASStudioClient:
     ) -> dict:
         """Fetch rows from a SAS library table as JSON via the Studio data API.
 
-        Returns {"columns": [...], "rows": [[...], ...]} or {} on error.
-        Uses POST /studio/sessions/{id}/data/libraries/{lib}/tables/{tbl}/rows
-        confirmed in Sas_studio.har.
+        Returns {"columns": [...], "rows": [[...], ...], "total": n} or {} on error.
+        Uses POST /studio/sessions/{id}/data/libraries/{lib}/tables/{tbl}/rows.
+
+        Response shapes vary by SAS Viya build, so this parser is defensive:
+          • columns: a list of strings (newer builds) OR a list of
+            {"name": ...} dicts (older / Sas_studio.har builds).
+          • row data: under "items" as arrays of cell values (newer builds)
+            OR under "rows" as dicts keyed by column name (older builds).
+          • count: -1 on builds that don't pre-count — fall back to len(rows).
+
+        Compute sessions use the Compute data API instead (different URL/shape).
         """
+        if self._is_compute(session_id):
+            return self._compute_get_table_rows(session_id, libref, table, limit)
         resp = self._http.post(
             f"{self.base_url}/studio/sessions/{session_id}"
             f"/data/libraries/{libref}/tables/{table}/rows",
@@ -476,14 +595,38 @@ class SASStudioClient:
         if not resp.is_success:
             return {}
         data = resp.json()
-        return {
-            "columns": [c.get("name", "") for c in data.get("columns", [])],
-            "rows":    [
-                [r.get(c.get("name", ""), "") for c in data.get("columns", [])]
-                for r in data.get("rows", [])
-            ],
-            "total": data.get("count", 0),
-        }
+
+        # Normalize column names (strings or {"name": ...} dicts).
+        columns = [
+            c.get("name", "") if isinstance(c, dict) else str(c)
+            for c in data.get("columns", [])
+        ]
+
+        # Normalize rows to a list of value-lists aligned to `columns`.
+        rows: list[list] = []
+        items = data.get("items")
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, list):
+                    rows.append(list(it))
+                elif isinstance(it, dict):
+                    cells = it.get("cells")
+                    if isinstance(cells, list):
+                        rows.append(list(cells))
+                    else:
+                        rows.append([it.get(name, "") for name in columns])
+        else:
+            for r in data.get("rows", []):
+                if isinstance(r, dict):
+                    rows.append([r.get(name, "") for name in columns])
+                elif isinstance(r, list):
+                    rows.append(list(r))
+
+        total = data.get("count", 0)
+        if not isinstance(total, int) or total < 0:
+            total = len(rows)
+
+        return {"columns": columns, "rows": rows, "total": total}
 
     def rows_to_html(self, table_data: dict, title: str = "") -> str:
         """Convert get_table_rows() output to a simple styled HTML table."""
@@ -515,6 +658,12 @@ class SASStudioClient:
 </body></html>"""
 
     def get_table_meta(self, session_id: str, libref: str, table: str) -> dict:
+        if self._is_compute(session_id):
+            resp = self._http.get(
+                f"{self.base_url}/compute/sessions/{session_id}/data/{libref}/{table}",
+                headers=self._hdrs(),
+            )
+            return resp.json() if resp.is_success else {}
         resp = self._http.get(
             f"{self.base_url}/studio/sessions/{session_id}/data/libraries/{libref}/tables/{table}",
             headers=self._hdrs(),
@@ -523,15 +672,31 @@ class SASStudioClient:
         return resp.json()
 
     def get_table_columns(self, session_id: str, libref: str, table: str) -> list:
+        if self._is_compute(session_id):
+            return self._compute_get_table_columns(session_id, libref, table)
+        # Newer SAS Viya builds reject application/json here with HTTP 415 and
+        # require the SAS Studio vendor media type. Send the vendor type first,
+        # then fall back to application/json for older builds (per the HAR).
+        # NOTE: if this returns [] the Query flow builder selects zero columns,
+        # producing an empty output table — so the content type must be right.
+        url = (f"{self.base_url}/studio/sessions/{session_id}"
+               f"/data/libraries/{libref}/tables/{table}/columns")
+        body = {"start": 0, "limit": 1000}
         resp = self._http.post(
-            f"{self.base_url}/studio/sessions/{session_id}/data/libraries/{libref}/tables/{table}/columns",
-            headers=self._hdrs("application/json"),
-            json={"start": 0, "limit": 1000},
+            url,
+            headers=self._hdrs("application/vnd.sas.studio.columns.request+json"),
+            json=body,
         )
+        if resp.status_code == 415:
+            resp = self._http.post(
+                url, headers=self._hdrs("application/json"), json=body
+            )
         resp.raise_for_status()
         return resp.json().get("items", [])
 
     def list_libraries(self, session_id: str) -> list:
+        if self._is_compute(session_id):
+            return self._compute_list_libraries(session_id)
         resp = self._http.get(
             f"{self.base_url}/studio/sessions/{session_id}/data/libraries",
             headers=self._hdrs(),
@@ -541,6 +706,8 @@ class SASStudioClient:
         return resp.json().get("items", [])
 
     def list_tables(self, session_id: str, libref: str) -> list:
+        if self._is_compute(session_id):
+            return self._compute_list_tables(session_id, libref)
         resp = self._http.get(
             f"{self.base_url}/studio/sessions/{session_id}/data/libraries/{libref}/tables",
             headers=self._hdrs(),
@@ -790,6 +957,124 @@ class SASStudioClient:
             },
         }
 
+    # ── Query via PROC SQL (build-independent) ────────────────────────────────
+    # The dataFlow "Query" step (submit_query_flow) relies on a JSON schema that
+    # some SAS Viya builds silently ignore — the flow "completes" but emits no
+    # SQL and writes no output table. This path expresses the same
+    # select / filter / sort as PROC SQL and submits it as ordinary code, which
+    # every build runs identically.
+
+    @staticmethod
+    def _quote_sas_name(name: str) -> str:
+        """SAS-safe column reference: simple identifiers pass through, anything
+        else (spaces, punctuation) becomes a name literal — \"col name\"n."""
+        import re
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name or ""):
+            return name
+        return '"' + (name or "").replace('"', '""') + '"n'
+
+    @staticmethod
+    def _is_numeric_literal(val) -> bool:
+        try:
+            float(val)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    def _sql_filter_clause(self, col: str, operator: str, value: str,
+                           col_types: dict) -> str:
+        name = self._quote_sas_name(col)
+        ctype = (col_types.get((col or "").upper(), "") or "").upper()
+        # Character if the column type says so, or (type unknown) the value is
+        # non-numeric. Numeric values are emitted unquoted.
+        is_char = ctype.startswith(("CHAR", "VARCHAR")) or (
+            not ctype and not self._is_numeric_literal(value)
+        )
+
+        def lit(v) -> str:
+            return "'" + str(v).replace("'", "''") + "'" if is_char else str(v)
+
+        op = (operator or "equals").lower()
+        if op == "notequals":           return f"{name} ne {lit(value)}"
+        if op == "lessthan":            return f"{name} < {lit(value)}"
+        if op == "greaterthan":         return f"{name} > {lit(value)}"
+        if op == "lessthanorequals":    return f"{name} <= {lit(value)}"
+        if op == "greaterthanorequals": return f"{name} >= {lit(value)}"
+        if op == "contains":
+            return f"{name} like '%{str(value).replace(chr(39), chr(39)*2)}%'"
+        if op == "startswith":
+            return f"{name} like '{str(value).replace(chr(39), chr(39)*2)}%'"
+        return f"{name} = {lit(value)}"  # equals / default
+
+    def build_query_sql(
+        self,
+        input_libref: str, input_table: str,
+        output_libref: str, output_table: str,
+        selected_columns: Optional[list[str]] = None,
+        sort_by: Optional[list[dict]] = None,
+        filters: Optional[list[dict]] = None,
+        col_types: Optional[dict] = None,
+    ) -> str:
+        """Render a PROC SQL step equivalent to a Studio Query flow."""
+        col_types = col_types or {}
+        sel = (", ".join(self._quote_sas_name(c) for c in selected_columns)
+               if selected_columns else "*")
+        sql = (f"proc sql;\n"
+               f"  create table {output_libref}.{output_table} as\n"
+               f"  select {sel}\n"
+               f"  from {input_libref}.{input_table}")
+        clauses = [
+            self._sql_filter_clause(
+                f["column"], f.get("operator", "equals"),
+                str(f.get("value", "")), col_types,
+            )
+            for f in (filters or [])
+        ]
+        if clauses:
+            sql += "\n  where " + " and ".join(clauses)
+        if sort_by:
+            order = []
+            for s in sort_by:
+                nm = self._quote_sas_name(s["column"])
+                order.append(nm if s.get("ascending", True) else nm + " desc")
+            sql += "\n  order by " + ", ".join(order)
+        sql += ";\nquit;"
+        return sql
+
+    def run_query_via_sql(
+        self,
+        session_id: str,
+        input_libref: str, input_table: str,
+        output_libref: str, output_table: str,
+        selected_columns: Optional[list[str]] = None,
+        sort_by: Optional[list[dict]] = None,
+        filters: Optional[list[dict]] = None,
+        max_wait: int = 120,
+    ) -> dict:
+        """Build PROC SQL from the query spec, submit it, and wait for completion.
+
+        Returns {"submission_id", "state", "sql"}. The caller reads the output
+        table with get_table_rows().
+        """
+        self._ensure_sassession(session_id)
+        # Column types let us quote character filter values correctly.
+        col_types: dict = {}
+        try:
+            for col in self.get_table_columns(session_id, input_libref, input_table):
+                col_types[(col.get("name", "") or "").upper()] = col.get("type", "")
+        except Exception:
+            pass
+        sql = self.build_query_sql(
+            input_libref, input_table, output_libref, output_table,
+            selected_columns, sort_by, filters, col_types,
+        )
+        submission = self.submit_code(session_id, sql, label="Query.sas")
+        submission_id = submission.get("id", "")
+        state = self.wait_for_completion(
+            session_id, submission_id, is_flow=False, max_wait=max_wait
+        )
+        return {"submission_id": submission_id, "state": state, "sql": sql}
+
     # ── Code submission ──────────────────────────────────────────────────────
 
     def submit_code(
@@ -798,10 +1083,14 @@ class SASStudioClient:
         code: str,
         label: str = "SAS Program.sas",
     ) -> dict:
-        """Submit raw SAS code to a Studio foreground session.
+        """Submit raw SAS code to a session.
 
-        Returns the submission response dict containing ``id`` (submission ID).
+        Returns a dict containing ``id`` — the submission ID (Studio) or job ID
+        (Compute). wait_for_completion / get_log / get_html_result accept the
+        same id and route by session type.
         """
+        if self._is_compute(session_id):
+            return {"id": self._compute_run_job(session_id, code)}
         resp = self._http.post(
             f"{self.base_url}/studio/sessions/{session_id}/foreground/submissions",
             headers=self._hdrs("application/json"),
@@ -860,7 +1149,13 @@ class SASStudioClient:
         available, otherwise falls back to longpoll with ``flowStatus=true``.
         For code submissions (``is_flow=False``): always uses longpoll and
         detects ``JobCompleted`` / ``JobFailed`` message types.
+
+        For Compute sessions, ``submission_id`` is a job ID and we poll the
+        Compute job state endpoint instead.
         """
+        if self._is_compute(session_id):
+            return self._compute_wait(session_id, submission_id, max_wait=max_wait)
+
         deadline = time.time() + max_wait
 
         if compute_job_link and is_flow:
@@ -936,6 +1231,19 @@ class SASStudioClient:
         return "timeout"
 
     def get_html_result(self, session_id: str, submission_id: str) -> Optional[str]:
+        if self._is_compute(session_id):
+            # Compute jobs don't expose an ODS-HTML endpoint like Studio does, so
+            # surface the SAS log as a readable monospace block. Tabular output
+            # is read separately via the data API (get_table_rows).
+            log = self._compute_get_log(session_id, submission_id)
+            if not log:
+                return None
+            esc = (log.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+            return (
+                "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>"
+                "<pre style=\"font-family:Consolas,Menlo,monospace;font-size:12px;"
+                "white-space:pre-wrap;line-height:1.35\">" + esc + "</pre></body></html>"
+            )
         resp = self._http.get(
             f"{self.base_url}/studio/sessions/{session_id}"
             f"/foreground/submissions/{submission_id}/results/html",
@@ -944,6 +1252,8 @@ class SASStudioClient:
         return resp.text if resp.is_success else None
 
     def get_log(self, session_id: str, submission_id: str) -> Optional[str]:
+        if self._is_compute(session_id):
+            return self._compute_get_log(session_id, submission_id) or None
         resp = self._http.get(
             f"{self.base_url}/studio/sessions/{session_id}"
             f"/foreground/submissions/{submission_id}/log",
@@ -952,6 +1262,8 @@ class SASStudioClient:
         return resp.text if resp.is_success else None
 
     def get_output_tables(self, session_id: str, submission_id: str) -> list:
+        if self._is_compute(session_id):
+            return self._compute_output_tables(session_id, submission_id)
         resp = self._http.get(
             f"{self.base_url}/studio/sessions/{session_id}"
             f"/foreground/submissions/{submission_id}/tables",
@@ -966,7 +1278,23 @@ class SASStudioClient:
 
         Browses @contentroot and picks the first item with contentType in
         ('myFolder', 'userFolder').  Falls back to the first folder listed.
+
+        Compute sessions have no /files endpoint, so they resolve My Folder via
+        the Folders service alias directly.
         """
+        if self._is_compute(session_id):
+            try:
+                r = self._http.get(
+                    f"{self.base_url}/folders/folders/@myFolder",
+                    headers=self._hdrs(),
+                    timeout=15.0,
+                )
+                if r.is_success:
+                    fid = r.json().get("id", "")
+                    return f"/folders/folders/{fid}" if fid else None
+            except Exception:
+                pass
+            return None
         try:
             r = self._http.get(
                 f"{self.base_url}/studio/sessions/{session_id}/files/%40contentroot/members",
@@ -978,17 +1306,24 @@ class SASStudioClient:
             if not r.is_success:
                 return None
             items = r.json().get("items", [])
+
+            def _clean(uri: str) -> str:
+                # SAS may return 'sascontent:/folders/folders/{id}' — strip the
+                # prefix so we always hand back a clean '/folders/folders/{id}'.
+                if uri.startswith("sascontent:"):
+                    uri = uri.replace("sascontent:", "", 1)
+                return uri
+
             # Prefer myFolder / userFolder content types
             for ct in ("myFolder", "userFolder"):
                 for item in items:
                     if item.get("contentType") == ct:
-                        uri = item.get("uri", "")
-                        # uri looks like /folders/folders/{uuid}
+                        uri = _clean(item.get("uri", ""))
                         if uri.startswith("/folders/folders/"):
                             return uri
             # Fall back to first folder
             for item in items:
-                uri = item.get("uri", "")
+                uri = _clean(item.get("uri", ""))
                 if uri.startswith("/folders/folders/"):
                     return uri
         except Exception:
@@ -1143,13 +1478,25 @@ class SASStudioClient:
             timeout=30.0,
         )
         if resp.status_code == 403:
+            # Surface SAS's ACTUAL 403 body — do not assume it's a folder write
+            # ACL. A 403 here can also be an OAuth scope/capability problem or a
+            # parentFolderUri that resolved to the wrong object. The real message
+            # tells us which; the caller (server handler) still treats this as the
+            # "try My Folder" signal via the PermissionError type.
+            detail = (resp.text or "").strip()
             raise PermissionError(
-                f"Cannot save to folder '{folder_uri}' — 403 Forbidden. "
-                "You do not have write permission to this folder. "
-                "Save to 'My Folder' instead: omit folder_uri or pass the URI "
-                "for My Folder from sas_studio_list_content_folders."
+                f"SAS refused the save to '{folder_uri}' with HTTP 403 Forbidden. "
+                f"SAS said: {detail[:600] or '(empty body)'}"
             )
-        resp.raise_for_status()
+        if not resp.is_success:
+            # Surface SAS's actual error body — a bare raise_for_status() hides
+            # WHY a 400 happened (bad parentFolderUri format, invalid step
+            # reference, etc.), leaving the assistant to guess.
+            detail = (resp.text or "").strip()
+            raise RuntimeError(
+                f"SAS rejected the flow save (HTTP {resp.status_code}) for "
+                f"parentFolderUri='{folder_uri}'. SAS said: {detail[:600]}"
+            )
         data = resp.json()
         flow_id = data.get("id", "")
 
