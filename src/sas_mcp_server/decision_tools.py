@@ -13,10 +13,16 @@ rule set and Python/SQL code nodes):
   * **Code files**      ``/decisions/codeFiles`` (+ ``/files/files``) — SQL/Python nodes
 
 They cover the create / read / delete lifecycle for each asset type plus rule
-authoring, so the assistant can list and inspect existing decisions, rule sets
-and code files, and create new ones. (Wiring nodes together into a runnable
-decision flow — the large step/mapping assembly — is intentionally left as a
-follow-up; these build the decision and its building blocks.)
+authoring (including editing a rule in place), assembling nodes into a runnable
+flow (rule-set, code-file, **model**, **sub-decision** and if/then/else branch
+nodes), publishing, and **testing/scoring** a decision against a CAS table. They
+also manage the reference data decisions rely on — **global variables** and
+**lookup tables** (reference-data domains) — and can list the registered custom
+REST node types (Segmentation Tree, Decision Rest Node, Language Model Query).
+
+The flow-node endpoints, test/score flow, global-variable and lookup shapes were
+reverse-engineered from ``Decision.har`` (the Build Decisions UI building a flow
+with a rule-set and a model node, editing a rule, and running the Test feature).
 
 Auth model is identical to the other tool modules: every tool resolves the
 caller's Viya access token via ``get_token(ctx)`` and calls the services **as
@@ -25,7 +31,9 @@ that user**, honoring their folder permissions.
 
 from __future__ import annotations
 
+import asyncio
 import re
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -47,9 +55,15 @@ _VALIDATION_REQ = "application/vnd.sas.decision.expression.validation.request+js
 _VALIDATION_RESP = "application/vnd.sas.validation+json"
 _PUBLISH_REQ = "application/vnd.sas.models.publishing.request.asynchronous+json"
 _DS2 = "text/vnd.sas.source.ds2"
+_MODEL = "application/vnd.sas.models.model+json"
+_GV = "application/vnd.sas.data.reference.global.variable+json"
+_DOMAIN = "application/vnd.sas.data.reference.domain+json"
+_DOMAIN_CONTENT = "application/vnd.sas.data.reference.domain.content+json"
+_NODE_TYPE = "application/vnd.sas.decision.node.type+json"
 
 _VALID_DATATYPES = ("string", "integer", "decimal", "double", "date", "datetime", "boolean", "dataGrid")
 _VALID_DIRECTIONS = ("input", "output", "inOut")
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
 def _trim(item: dict[str, Any]) -> dict[str, Any]:
@@ -67,6 +81,83 @@ def _sig_vars(sig: list[dict] | None) -> list[dict[str, Any]]:
 
 def _q(value: str) -> str:
     return value.replace("'", "''")
+
+
+def _build_node_mappings(
+    node_sig: list[dict], existing_names: set[str]
+) -> tuple[list[dict], list[dict]]:
+    """Build a node's flow-step ``mappings`` and any new decision-signature variables.
+
+    Each node variable becomes a mapping (``stepTermName`` = the variable name, which
+    SAS wires to a same-named decision variable). Scalar outputs also carry
+    ``targetDecisionTermName`` so they write back to the decision; dataGrid outputs
+    are step-local. ``existing_names`` is mutated with the names added.
+    """
+    mappings: list[dict] = []
+    new_vars: list[dict] = []
+    for v in node_sig:
+        name = v.get("name")
+        if not name:
+            continue
+        dt = v.get("dataType", "string")
+        direction = v.get("direction", "inOut")
+        length = v.get("length")
+        is_grid = dt == "dataGrid"
+        mid = str(uuid.uuid4())
+        m: dict[str, Any] = {"direction": direction, "dataType": dt, "stepTermName": name,
+                             "id": mid, "originalId": mid, "description": ""}
+        if length:
+            m["length"] = length
+        if direction == "output" and not is_grid:
+            m["targetDecisionTermName"] = name
+        mappings.append(m)
+        # mirror the variable into the decision signature (skip step-local dataGrids)
+        if not is_grid and name not in existing_names:
+            dv: dict[str, Any] = {"name": name, "dataType": dt, "direction": direction,
+                                  "id": str(uuid.uuid4())}
+            if length:
+                dv["length"] = length
+            new_vars.append(dv)
+            existing_names.add(name)
+    return mappings, new_vars
+
+
+def _build_model_mappings(
+    model_vars: list[dict], existing_names: set[str]
+) -> tuple[list[dict], list[dict]]:
+    """Build a model node's flow-step ``mappings`` and any new decision variables.
+
+    Model variables come from ``/modelRepository/models/{id}/variables`` (each has
+    ``name``, ``role`` input/output, ``type`` and ``length``). Unlike rule-set/code
+    nodes, a model node writes ``targetDecisionTermName`` on **every** mapping — both
+    its inputs (read from the decision) and outputs (written back) — so each model
+    variable is wired to a same-named decision variable (created if missing). This
+    mirrors the ``step.model`` payload SAS Decision Manager sends (Decision.har).
+    """
+    mappings: list[dict] = []
+    new_vars: list[dict] = []
+    for v in model_vars or []:
+        name = v.get("name")
+        if not name:
+            continue
+        dt = v.get("type") or v.get("dataType") or "string"
+        direction = "output" if str(v.get("role", "input")).lower() == "output" else "input"
+        length = v.get("length")
+        mid = str(uuid.uuid4())
+        m: dict[str, Any] = {"direction": direction, "dataType": dt, "stepTermName": name,
+                             "id": mid, "originalId": mid, "description": "",
+                             "targetDecisionTermName": name}
+        if length:
+            m["length"] = length
+        mappings.append(m)
+        if name not in existing_names:
+            dv: dict[str, Any] = {"name": name, "dataType": dt, "direction": direction,
+                                  "id": str(uuid.uuid4())}
+            if length:
+                dv["length"] = length
+            new_vars.append(dv)
+            existing_names.add(name)
+    return mappings, new_vars
 
 
 def _sanitize_ident(name: str) -> str:
@@ -371,6 +462,7 @@ def register_decision_tools(
                         f"/businessRules/ruleSets/{rule_set_id}/rules", client, limit=200)
                     for r in items:
                         rules_summary.append({
+                            "id": r.get("id"),
                             "name": r.get("name"),
                             "conditional": r.get("conditional"),
                             "conditions": [f"{(c.get('term') or {}).get('name')} {c.get('expression')}"
@@ -493,6 +585,94 @@ def register_decision_tools(
                 return {"status": "added", "rule_id": res.get("id"), "name": res.get("name"),
                         "rule_set_id": rule_set_id,
                         "url": _dm_url("rules", rule_set_id)}
+        except Exception as e:
+            return _err(e)
+
+    @mcp.tool(
+        name="sas_edit_rule",
+        description=(
+            "Edit an existing rule in place (change a condition/action expression, the "
+            "conditional, or the rule name) and save — NOT delete-and-re-add, so the "
+            "rule keeps its id and history. Identify the rule with `rule_set_id` + "
+            "`rule_id` (see sas_get_rule_set for the rules in a set; the rule_id is each "
+            "rule's id).\n"
+            "  set_conditions: list of {variable, expression} — replaces the expression "
+            "of the existing condition on that variable, e.g. {'variable':'Dealer_Type', "
+            "'expression':'= \"D01\"'}.\n"
+            "  set_actions: list of {variable, expression} — replaces the existing action "
+            "on that variable, e.g. {'variable':'Discount', 'expression':'Discount + 5'}.\n"
+            "  conditional / name: optionally change the rule's conditional ('if'/'elseif'/"
+            "'else') or name.\n"
+            "Only variables already used by the rule can be edited this way. String "
+            "literals in expressions must be quoted."
+        ),
+    )
+    async def sas_edit_rule(
+        rule_set_id: str, rule_id: str, ctx: Context,
+        set_conditions: list[dict] | None = None, set_actions: list[dict] | None = None,
+        conditional: str | None = None, name: str | None = None,
+    ) -> Any:
+        set_conditions = set_conditions or []
+        set_actions = set_actions or []
+        if not (set_conditions or set_actions or conditional or name):
+            return {"status": "invalid",
+                    "message": "Nothing to change — pass set_conditions, set_actions, "
+                               "conditional or name."}
+        try:
+            async with session("sas_edit_rule", ctx) as client:
+                # fetch the rule and its ETag (the PUT requires an If-Match precondition)
+                g = await client.get(
+                    f"{VIYA_ENDPOINT}/businessRules/ruleSets/{rule_set_id}/rules/{rule_id}",
+                    headers={"Accept": "application/json"})
+                if g.status_code == 404:
+                    return {"status": "not_found",
+                            "rule_set_id": rule_set_id, "rule_id": rule_id}
+                g.raise_for_status()
+                etag = g.headers.get("ETag")
+                rule = _trim(g.json())
+
+                def _apply(items: list[dict], changes: list[dict], kind: str) -> str | None:
+                    for ch in changes:
+                        var = ch.get("variable")
+                        expr = ch.get("expression")
+                        target = next((it for it in items
+                                       if (it.get("term") or {}).get("name") == var), None)
+                        if target is None:
+                            avail = sorted({(it.get("term") or {}).get("name")
+                                            for it in items if it.get("term")})
+                            return (f"No {kind} on variable '{var}' in this rule. "
+                                    f"Editable {kind} variables: {avail or '(none)'}.")
+                        target["expression"] = expr
+                        target["status"] = "valid"
+                    return None
+
+                err = _apply(rule.setdefault("conditions", []), set_conditions, "condition")
+                if err:
+                    return {"status": "unknown_variable", "message": err}
+                err = _apply(rule.setdefault("actions", []), set_actions, "action")
+                if err:
+                    return {"status": "unknown_variable", "message": err}
+                if conditional:
+                    rule["conditional"] = conditional
+                if name:
+                    rule["name"] = name
+                put_headers = {"Content-Type": "application/json", "Accept": "application/json"}
+                if etag:
+                    put_headers["If-Match"] = etag
+                r = await client.put(
+                    f"{VIYA_ENDPOINT}/businessRules/ruleSets/{rule_set_id}/rules/{rule_id}",
+                    json=rule, headers=put_headers)
+                if r.status_code == 404:
+                    return {"status": "not_found", "rule_set_id": rule_set_id, "rule_id": rule_id}
+                r.raise_for_status()
+                res = r.json()
+                return {"status": "updated", "rule_id": res.get("id"), "name": res.get("name"),
+                        "conditional": res.get("conditional"),
+                        "conditions": [f"{(c.get('term') or {}).get('name')} {c.get('expression')}"
+                                       for c in (res.get("conditions") or [])],
+                        "actions": [f"{(a.get('term') or {}).get('name')} = {a.get('expression')}"
+                                    for a in (res.get("actions") or [])],
+                        "rule_set_id": rule_set_id, "url": _dm_url("rules", rule_set_id)}
         except Exception as e:
             return _err(e)
 
@@ -795,5 +975,724 @@ def register_decision_tools(
                 return {"publish_id": publish_id,
                         "status": "success" if ok else "see_log",
                         "log": str(log)[:4000]}
+        except Exception as e:
+            return _err(e)
+
+    # ── Flow assembly: add real nodes / branches INTO a decision ───────────────
+
+    async def _resolve_node_step(client, node: dict, existing_names: set) -> tuple[dict, list]:
+        """Build ``(flow_step, new_signature_vars)`` for a node spec
+        ``{"type": "rule_set"|"code_file"|"model"|"decision", "id": "..."}``. Raises
+        ValueError on a bad spec; lets httpx 404s propagate so the caller can report
+        not-found."""
+        ntype = str((node or {}).get("type", "")).lower().replace(" ", "_")
+        nid = (node or {}).get("id")
+        if not nid:
+            raise ValueError("each node needs an 'id'")
+        sid = str(uuid.uuid4())
+        if ntype in ("model",):
+            model = await get_json(f"/modelRepository/models/{nid}", client, accept=_MODEL)
+            mvars, _ = await get_paged_items(
+                f"/modelRepository/models/{nid}/variables", client, limit=500)
+            mappings, new_vars = _build_model_mappings(mvars, existing_names)
+            step = {"id": sid, "originalId": sid,
+                    "type": "application/vnd.sas.decision.step.model",
+                    "model": {"name": model.get("name"), "id": nid},
+                    "mappings": mappings}
+            return step, new_vars
+        if ntype in ("decision", "sub_decision", "subdecision"):
+            sub = await get_json(f"/decisions/flows/{nid}", client, accept=_DEC)
+            revs, _ = await get_paged_items(
+                f"/decisions/flows/{nid}/revisions", client, limit=1,
+                extra_params={"sortBy": "modifiedTimeStamp:descending"})
+            if not revs:
+                raise ValueError(f"could not resolve a revision for decision {nid}")
+            mappings, new_vars = _build_node_mappings(sub.get("signature", []), existing_names)
+            step = {"id": sid, "originalId": sid,
+                    "type": "application/vnd.sas.decision.step.decision",
+                    "decision": {"name": sub.get("name"), "id": nid,
+                                 "versionId": revs[0].get("id"),
+                                 "versionName": f"{sub.get('majorRevision', 1)}.{sub.get('minorRevision', 0)}"},
+                    "mappings": mappings}
+            return step, new_vars
+        if ntype in ("rule_set", "ruleset"):
+            rs = await get_json(f"/businessRules/ruleSets/{nid}", client, accept=_RS_INTEGRAL)
+            revs, _ = await get_paged_items(
+                f"/businessRules/ruleSets/{nid}/revisions", client, limit=1,
+                extra_params={"sortBy": "modifiedTimeStamp:descending"})
+            if not revs:
+                raise ValueError(f"could not resolve a revision for rule set {nid}")
+            mappings, new_vars = _build_node_mappings(rs.get("signature", []), existing_names)
+            step = {"id": sid, "originalId": sid,
+                    "type": "application/vnd.sas.decision.step.ruleset",
+                    "ruleSetType": rs.get("ruleSetType", "assignment"),
+                    "ruleset": {"name": rs.get("name"), "id": nid,
+                                "versionId": revs[0].get("id"),
+                                "versionName": f"{rs.get('majorRevision', 1)}.{rs.get('minorRevision', 0)}"},
+                    "mappings": mappings}
+            return step, new_vars
+        if ntype in ("code_file", "codefile"):
+            cf = await get_json(f"/decisions/codeFiles/{nid}", client, accept=_CF)
+            revs, _ = await get_paged_items(
+                f"/decisions/codeFiles/{nid}/revisions", client, limit=1,
+                extra_params={"sortBy": "modifiedTimeStamp:descending"})
+            if not revs:
+                raise ValueError(f"could not resolve a revision for code file {nid}")
+            mappings, new_vars = _build_node_mappings(cf.get("signature", []), existing_names)
+            step = {"id": sid, "originalId": sid,
+                    "type": "application/vnd.sas.decision.step.custom.object",
+                    "customObject": {"uri": f"/decisions/codeFiles/{nid}/revisions/{revs[0].get('id')}",
+                                     "name": cf.get("name"), "type": cf.get("type"), "isRestDNT": False},
+                    "mappings": mappings}
+            return step, new_vars
+        raise ValueError(f"unknown node type {ntype!r}; use 'rule_set', 'code_file', "
+                         "'model' or 'decision'")
+
+    async def _get_decision_etag(client, decision_id):
+        g = await client.get(f"{VIYA_ENDPOINT}/decisions/flows/{decision_id}",
+                             headers={"Accept": _DEC})
+        g.raise_for_status()
+        return g.json(), g.headers.get("ETag")
+
+    async def _put_decision(client, decision_id, dec, etag):
+        headers = {"Content-Type": _DEC, "Accept": _DEC}
+        if etag:
+            headers["If-Match"] = etag
+        r = await client.put(f"{VIYA_ENDPOINT}/decisions/flows/{decision_id}",
+                             json=dec, headers=headers)
+        r.raise_for_status()
+        updated = r.json()
+        steps = (updated.get("flow") or {}).get("steps") or []
+        return {"status": "added", "decision_id": decision_id,
+                "decision": updated.get("name"), "stepCount": len(steps),
+                "flow": _flow_outline(steps), "url": _dm_url("decisions", decision_id)}
+
+    async def _append_single_node(client, decision_id, node):
+        dec, etag = await _get_decision_etag(client, decision_id)
+        existing = {v.get("name") for v in dec.get("signature", [])}
+        step, new_vars = await _resolve_node_step(client, node, existing)
+        dec.setdefault("signature", []).extend(new_vars)
+        dec.setdefault("flow", {}).setdefault("steps", []).append(step)
+        return await _put_decision(client, decision_id, dec, etag)
+
+    @mcp.tool(
+        name="sas_add_rule_set_to_decision",
+        description=(
+            "Add a rule set as a NODE inside a decision flow — this is how you build a "
+            "real, non-empty decision. The rule set's variables are auto-wired to the "
+            "decision's variables (created if needed). After this the decision actually "
+            "contains the rule set (not just start/end). Returns the new step count and "
+            "flow outline. Build a decision by: sas_create_decision, then call this (and "
+            "sas_add_code_file_to_decision / sas_add_condition_branch) for each node."
+        ),
+    )
+    async def sas_add_rule_set_to_decision(
+        decision_id: str, rule_set_id: str, ctx: Context
+    ) -> Any:
+        try:
+            async with session("sas_add_rule_set_to_decision", ctx) as client:
+                return await _append_single_node(
+                    client, decision_id, {"type": "rule_set", "id": rule_set_id})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return {"status": "not_found",
+                        "message": f"Decision or rule set not found ({decision_id} / {rule_set_id})."}
+            return _err(e)
+        except ValueError as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            return _err(e)
+
+    @mcp.tool(
+        name="sas_add_code_file_to_decision",
+        description=(
+            "Add a code file (SQL/Python node) as a NODE inside a decision flow. The code "
+            "file's input/output variables are auto-wired to the decision's variables. "
+            "After this the decision actually contains the code node. Use together with "
+            "sas_add_rule_set_to_decision / sas_add_condition_branch to assemble a flow."
+        ),
+    )
+    async def sas_add_code_file_to_decision(
+        decision_id: str, code_file_id: str, ctx: Context
+    ) -> Any:
+        try:
+            async with session("sas_add_code_file_to_decision", ctx) as client:
+                return await _append_single_node(
+                    client, decision_id, {"type": "code_file", "id": code_file_id})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return {"status": "not_found",
+                        "message": f"Decision or code file not found ({decision_id} / {code_file_id})."}
+            return _err(e)
+        except ValueError as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            return _err(e)
+
+    @mcp.tool(
+        name="sas_add_model_to_decision",
+        description=(
+            "Add a MODEL node (a model / analytic store from Model Manager) as a node "
+            "inside a decision flow — the Build Decisions 'Model' node. `model_id` is a "
+            "model in the SAS model repository (see sas_list_models if available, or the "
+            "model's id in Model Manager). The model's input/output variables are read "
+            "from the repository and auto-wired to the decision's variables (created if "
+            "needed) — its inputs are read from the decision, its scored outputs "
+            "(EM_*/P_*/I_* etc.) are written back. Returns the new step count and flow "
+            "outline."
+        ),
+    )
+    async def sas_add_model_to_decision(
+        decision_id: str, model_id: str, ctx: Context
+    ) -> Any:
+        try:
+            async with session("sas_add_model_to_decision", ctx) as client:
+                return await _append_single_node(
+                    client, decision_id, {"type": "model", "id": model_id})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return {"status": "not_found",
+                        "message": f"Decision or model not found ({decision_id} / {model_id})."}
+            return _err(e)
+        except ValueError as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            return _err(e)
+
+    @mcp.tool(
+        name="sas_add_decision_to_decision",
+        description=(
+            "Add a SUB-DECISION node — another decision flow nested as a node inside this "
+            "decision flow (the Build Decisions 'Decision' node, a decision inside a "
+            "decision). `sub_decision_id` is the decision to embed. Its signature "
+            "variables are auto-wired to this decision's variables (created if needed). "
+            "Returns the new step count and flow outline."
+        ),
+    )
+    async def sas_add_decision_to_decision(
+        decision_id: str, sub_decision_id: str, ctx: Context
+    ) -> Any:
+        if sub_decision_id == decision_id:
+            return {"status": "invalid", "message": "A decision cannot contain itself."}
+        try:
+            async with session("sas_add_decision_to_decision", ctx) as client:
+                return await _append_single_node(
+                    client, decision_id, {"type": "decision", "id": sub_decision_id})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return {"status": "not_found",
+                        "message": f"Decision not found ({decision_id} / {sub_decision_id})."}
+            return _err(e)
+        except ValueError as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            return _err(e)
+
+    @mcp.tool(
+        name="sas_add_condition_branch",
+        description=(
+            "Add an IF / THEN / ELSE branch (a condition node) to a decision flow — this is "
+            "how you build ADVANCED flows that route to different nodes based on data.\n"
+            "`condition_variable` must be a variable already in the decision (e.g. one a "
+            "prior node outputs, or a rule-set variable) — call sas_get_decision to see the "
+            "decision's variables. `operator` is one of =, <>, >, <, >=, <=. `value` is the "
+            "constant compared against.\n"
+            "`then_nodes` / `else_nodes` are the nodes to run in each branch — each a list of "
+            "{type:'rule_set'|'code_file', id:'<asset id>'}. Either branch may be empty.\n"
+            "Example: route on Age — then_nodes=[{type:'code_file', id:'...approve...'}], "
+            "else_nodes=[{type:'code_file', id:'...decline...'}], condition_variable='Age', "
+            "operator='>=', value='21'."
+        ),
+    )
+    async def sas_add_condition_branch(
+        decision_id: str, condition_variable: str, operator: str, value: str, ctx: Context,
+        then_nodes: list[dict] | None = None, else_nodes: list[dict] | None = None,
+    ) -> Any:
+        ops = {"=", "<>", "!=", ">", "<", ">=", "<="}
+        if operator not in ops:
+            return {"status": "invalid", "message": f"operator must be one of {sorted(ops)}."}
+        then_nodes = then_nodes or []
+        else_nodes = else_nodes or []
+        try:
+            async with session("sas_add_condition_branch", ctx) as client:
+                dec, etag = await _get_decision_etag(client, decision_id)
+                sig = dec.get("signature", [])
+                existing = {v.get("name") for v in sig}
+                lhs = next((v for v in sig if v.get("name") == condition_variable), None)
+                if not lhs:
+                    return {"status": "unknown_variable",
+                            "message": (f"'{condition_variable}' is not a variable in this decision "
+                                        f"yet. Add a node that produces it first. Available: "
+                                        f"{sorted(existing) or '(none — the decision is empty)'}.")}
+                then_steps, else_steps, all_new = [], [], []
+                for node in then_nodes:
+                    st, nv = await _resolve_node_step(client, node, existing)
+                    then_steps.append(st); all_new += nv
+                for node in else_nodes:
+                    st, nv = await _resolve_node_step(client, node, existing)
+                    else_steps.append(st); all_new += nv
+                cid, ot, of = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+                cond_step = {
+                    "id": cid, "originalId": cid,
+                    "type": "application/vnd.sas.decision.step.condition", "version": 1,
+                    "onTrue": {"id": ot, "steps": then_steps, "version": 1, "parentId": cid},
+                    "onFalse": {"id": of, "steps": else_steps, "version": 1},
+                    "name": "",
+                    "condition": {
+                        "lhsTerm": {"id": lhs.get("id"), "name": lhs.get("name"),
+                                    "dataType": lhs.get("dataType"),
+                                    "direction": lhs.get("direction", "inOut"), "description": ""},
+                        "operator": operator, "rhsConstant": str(value)}}
+                dec.setdefault("signature", []).extend(all_new)
+                dec.setdefault("flow", {}).setdefault("steps", []).append(cond_step)
+                return await _put_decision(client, decision_id, dec, etag)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return {"status": "not_found", "decision_id": decision_id}
+            return _err(e)
+        except ValueError as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            return _err(e)
+
+    # ── Test / run (score) a decision or rule set ──────────────────────────────
+
+    async def _latest_revision_uri(client, base: str) -> str | None:
+        revs, _ = await get_paged_items(
+            f"{base}/revisions", client, limit=1,
+            extra_params={"sortBy": "modifiedTimeStamp:descending"})
+        return f"{base}/revisions/{revs[0].get('id')}" if revs else None
+
+    @mcp.tool(
+        name="sas_test_decision",
+        description=(
+            "Test / run (score) a decision or rule set against a CAS input table and "
+            "return a sample of the scored output — the Build Decisions 'Test' feature. "
+            "Creates a score definition, runs it, waits for it to finish, and returns the "
+            "first rows of the output table.\n"
+            "  decision_id: the decision or rule set to test — its NAME or its id. A name "
+            "is resolved automatically (and whether it's a decision or a rule set is "
+            "auto-detected), so you do not need to look up the id first.\n"
+            "  object_type: optional hint, 'decision' (default) or 'rule_set'; ignored when "
+            "a name is given (the type is detected).\n"
+            "  input_table / input_library / server: the CAS table of input data to score "
+            "(default library 'Public', server 'cas-shared-default'). The table is loaded "
+            "into CAS automatically if it isn't already (scoring can't open an unloaded "
+            "table).\n"
+            "  max_rows: how many output rows to return (default 10).\n"
+            "  retries: how many times to re-run the scoring on a transient failure "
+            "(default 2) — a CAS/host hiccup mid-scoring is retried automatically.\n"
+            "Returns the execution state, how many attempts it took, the output table "
+            "name, and the sampled rows. If it is still running when the wait elapses, "
+            "returns the execution id so you can re-check."
+        ),
+    )
+    async def sas_test_decision(
+        decision_id: str, input_table: str, ctx: Context,
+        object_type: str = "decision", input_library: str = "Public",
+        server: str = "cas-shared-default", max_rows: int = 10, wait_seconds: int = 90,
+        retries: int = 2,
+    ) -> Any:
+        otype = object_type.lower().strip().replace(" ", "_")
+        otype = "rule_set" if otype == "ruleset" else otype
+        if otype not in ("decision", "rule_set"):
+            return {"status": "invalid", "message": "object_type must be 'decision' or 'rule_set'."}
+        _DECISION = ("/decisions/flows", "decision", _DEC)
+        _RULESET = ("/businessRules/ruleSets", "ruleSet", _RS_INTEGRAL)
+        try:
+            async with session("sas_test_decision", ctx) as client:
+                # Resolve the object to a (collection, descriptorType, accept) tuple.
+                # The caller — often an LLM — may pass a NAME instead of the UUID, and
+                # SAS returns 403 (not 404) for a non-id path, so look names up and
+                # auto-detect whether the target is a decision or a rule set.
+                obj = base = desc_type = accept = None
+                if _UUID_RE.match(decision_id.strip()):
+                    # try the hinted type first, then the other (handles a wrong hint)
+                    order = [_RULESET, _DECISION] if otype == "rule_set" else [_DECISION, _RULESET]
+                    for coll, dt, acc in order:
+                        try:
+                            obj = await get_json(f"{coll}/{decision_id}", client, accept=acc)
+                            base, desc_type, accept = f"{coll}/{decision_id}", dt, acc
+                            break
+                        except httpx.HTTPStatusError as e:
+                            if e.response.status_code in (403, 404):
+                                continue
+                            raise
+                    if obj is None:
+                        return {"status": "not_found", "decision_id": decision_id}
+                else:
+                    name = decision_id.strip()
+                    flt = f"eq(name,'{_q(name)}')"
+                    for coll, dt, acc in (_DECISION, _RULESET):
+                        items, _ = await get_paged_items(coll, client, limit=1, filters=flt)
+                        if items:
+                            rid = items[0].get("id")
+                            obj = await get_json(f"{coll}/{rid}", client, accept=acc)
+                            base, desc_type, accept = f"{coll}/{rid}", dt, acc
+                            break
+                    if obj is None:
+                        return {"status": "not_found",
+                                "message": f"No decision or rule set named '{name}' was found. "
+                                           "Pass its name or id (see sas_list_decisions / "
+                                           "sas_list_rule_sets)."}
+                rev_uri = await _latest_revision_uri(client, base)
+                if not rev_uri:
+                    return {"status": "error", "message": "Could not resolve a revision to test."}
+                obj_name = obj.get("name", "object")
+                # a unique suffix keeps the score definition / output table from colliding
+                # with a prior test run (the service rejects a duplicate definition name)
+                uniq = uuid.uuid4().hex[:6]
+                test_name = f"{obj_name}_Test_{uniq}"
+                table_base = f"{_sanitize_ident(obj_name)}_Test_{uniq}"
+                # map each signature variable to a same-named column in the input table
+                mappings = []
+                for t in obj.get("signature", []):
+                    nm = t.get("name")
+                    if not nm:
+                        continue
+                    term = {"name": nm, "dataType": t.get("dataType", "string"),
+                            "direction": t.get("direction", "inOut")}
+                    if t.get("length"):
+                        term["length"] = t["length"]
+                    mappings.append({"variableName": nm, "mappingType": "datasource",
+                                     "mappingValue": nm, "term": term})
+                # Ensure the input CAS table is loaded — a scoring run cannot open an
+                # unloaded table (it fails with "Table 'X' could not be loaded"). This
+                # loads it if a source exists; it's a no-op if already loaded.
+                try:
+                    await client.put(
+                        f"{VIYA_ENDPOINT}/casManagement/servers/{server}/caslibs/"
+                        f"{input_library}/tables/{input_table}/state",
+                        params={"value": "loaded"}, headers={"Accept": "application/json"})
+                except httpx.HTTPError:
+                    pass
+                # resolve a parent folder for the score definition (the user's home folder)
+                parent_uri = None
+                try:
+                    home = await get_json("/folders/folders/@myFolder", client)
+                    if home.get("id"):
+                        parent_uri = f"/folders/folders/{home['id']}"
+                except httpx.HTTPError:
+                    pass
+                def_body = {
+                    "name": test_name,
+                    "inputData": {"type": "CASTable", "libraryName": input_library,
+                                  "serverName": server, "tableName": input_table},
+                    "objectDescriptor": {"type": desc_type, "name": obj_name, "uri": rev_uri},
+                    "properties": {"version": "1.0", "test": "true",
+                                   "outputServerName": server, "outputLibraryName": input_library,
+                                   "tableBaseName": table_base},
+                    "mappings": mappings}
+                params = {"parentFolderUri": parent_uri} if parent_uri else None
+                dr = await client.post(f"{VIYA_ENDPOINT}/scoreDefinitions/definitions",
+                                       json=def_body, params=params,
+                                       headers={"Content-Type": "application/json",
+                                                "Accept": "application/json"})
+                dr.raise_for_status()
+                definition_id = dr.json().get("id")
+                # Run it, retrying the execution on a transient failure (a CAS/host
+                # hiccup mid-scoring surfaces as state="failed"). The definition is
+                # reused; each attempt gets its own guid + timestamped output table.
+                deadline = max(1, wait_seconds)
+                attempts = max(1, retries + 1)
+                execu: dict[str, Any] = {}
+                execution_id = None
+                state = None
+                used = 0
+                for attempt in range(attempts):
+                    used = attempt + 1
+                    exec_body = {
+                        "scoreDefinitionId": definition_id, "type": "scoreDefinition",
+                        "name": f"Execution for {test_name}",
+                        "hints": {"objectURI": rev_uri, "inputTableName": input_table,
+                                  "inputLibraryName": input_library,
+                                  "useGlobalVariableCurrentValues": "true",
+                                  "scoreRequestGuid": str(uuid.uuid4())}}
+                    try:
+                        er = await client.post(f"{VIYA_ENDPOINT}/scoreExecution/executions",
+                                               json=exec_body,
+                                               headers={"Content-Type": "application/json",
+                                                        "Accept": "application/json"})
+                        er.raise_for_status()
+                        execu = er.json()
+                        execution_id = execu.get("id")
+                        state = execu.get("state")
+                        waited = 0
+                        while state in ("running", "pending", None) and waited < deadline:
+                            await asyncio.sleep(min(3, deadline - waited))
+                            waited += 3
+                            pr = await client.get(
+                                f"{VIYA_ENDPOINT}/scoreExecution/executions/{execution_id}",
+                                headers={"Accept": "application/json"})
+                            if pr.is_success:
+                                execu = pr.json()
+                                state = execu.get("state")
+                    except httpx.HTTPError:
+                        state = "error"
+                    if state == "completed" or state not in ("failed", "canceled", "error"):
+                        break  # success, or still-running (don't retry a hang)
+                    if attempt < attempts - 1:
+                        await asyncio.sleep(2)  # brief backoff before retrying
+                result: dict[str, Any] = {
+                    "status": "completed" if state == "completed" else state or "running",
+                    "decision": obj_name, "definition_id": definition_id,
+                    "execution_id": execution_id, "state": state, "attempts": used,
+                    "url": _dm_url("decisions" if desc_type == "decision" else "rules", decision_id)}
+                if state != "completed":
+                    if state in ("failed", "canceled", "error"):
+                        base_msg = (execu.get("error") or {}).get("message") or \
+                            "Score execution did not complete successfully."
+                        result["message"] = (f"{base_msg} (tried {used}x)" if used > 1 else base_msg)
+                    else:
+                        result["message"] = ("Still running — re-run sas_test_decision or check "
+                                              f"score execution {execution_id} shortly.")
+                    return result
+                out = execu.get("outputTable") or {}
+                table = out.get("tableName")
+                lib = out.get("libraryName", input_library)
+                srv = out.get("serverName", server)
+                result["output_table"] = table
+                if table:
+                    try:
+                        cols, _ = await get_paged_items(
+                            f"/casManagement/servers/{srv}/caslibs/{lib}/tables/{table}/columns",
+                            client, limit=500)
+                        names = [c.get("name") for c in cols]
+                        rr = await client.get(
+                            f"{VIYA_ENDPOINT}/casRowSets/servers/{srv}/caslibs/{lib}/tables/{table}/rows",
+                            params={"formatted": "true", "limit": max_rows},
+                            headers={"Accept": "application/json"})
+                        rows = []
+                        if rr.is_success:
+                            for item in (rr.json().get("items") or [])[:max_rows]:
+                                cells = [str(c).strip() for c in (item.get("cells") or [])]
+                                rows.append(dict(zip(names, cells, strict=False)) if names else cells)
+                        result["row_count_returned"] = len(rows)
+                        result["rows"] = rows
+                    except httpx.HTTPError:
+                        result["message"] = ("Scored, but the output rows could not be read. "
+                                              f"See output table {table} in {lib}.")
+                return result
+        except Exception as e:
+            return _err(e)
+
+    # ── Global variables (reference data) ──────────────────────────────────────
+
+    @mcp.tool(
+        name="sas_list_global_variables",
+        description=(
+            "List SAS Intelligent Decisioning global variables (reference-data global "
+            "variables that decisions and rules can read). Returns each variable's name, "
+            "dataType and current value."
+        ),
+    )
+    async def sas_list_global_variables(
+        ctx: Context, limit: int = 100, start: int = 0
+    ) -> Any:
+        try:
+            async with session("sas_list_global_variables", ctx) as client:
+                items, count = await get_paged_items(
+                    "/referenceData/globalVariables", client, limit=limit, start=start,
+                    extra_params={"sortBy": "modifiedTimeStamp:descending"})
+                return {"count": count, "global_variables": [
+                    {k: it.get(k) for k in ("id", "name", "dataType", "length",
+                                            "value", "defaultValue", "description")}
+                    for it in items]}
+        except Exception as e:
+            return _err(e)
+
+    @mcp.tool(
+        name="sas_create_global_variable",
+        description=(
+            "Create a new SAS Intelligent Decisioning global variable (reference data) — "
+            "a named value available to every decision and rule. `data_type` is one of "
+            "string/integer/decimal/double/boolean/date/datetime. `value` is the variable's "
+            "value (and default). For string variables pass `length` (default 32)."
+        ),
+    )
+    async def sas_create_global_variable(
+        name: str, ctx: Context, data_type: str = "string",
+        value: Any = None, length: int | None = None, description: str = "",
+    ) -> Any:
+        dt = str(data_type).strip()
+        if dt not in _VALID_DATATYPES:
+            return {"status": "invalid",
+                    "message": f"data_type '{dt}' must be one of {_VALID_DATATYPES}."}
+        body: dict[str, Any] = {"name": name, "dataType": dt, "description": description}
+        if dt == "string":
+            body["length"] = length or 32
+        if value is not None:
+            body["value"] = value
+            body["defaultValue"] = value
+        try:
+            async with session("sas_create_global_variable", ctx) as client:
+                r = await client.post(f"{VIYA_ENDPOINT}/referenceData/globalVariables",
+                                      json=body, headers={"Content-Type": _GV, "Accept": _GV})
+                r.raise_for_status()
+                gv = r.json()
+                return {"status": "created", "id": gv.get("id"), "name": gv.get("name"),
+                        "dataType": gv.get("dataType"), "value": gv.get("value")}
+        except Exception as e:
+            return _err(e)
+
+    # ── Lookup tables (reference-data domains) ─────────────────────────────────
+
+    @mcp.tool(
+        name="sas_list_lookup_tables",
+        description=(
+            "List SAS Intelligent Decisioning lookup tables (reference-data domains — the "
+            "key/value tables that decisions and rules look values up in). Returns each "
+            "domain's id, name and description."
+        ),
+    )
+    async def sas_list_lookup_tables(
+        ctx: Context, name_contains: str | None = None, limit: int = 50, start: int = 0
+    ) -> Any:
+        filters = f"contains(name,'{_q(name_contains)}')" if name_contains else None
+        try:
+            async with session("sas_list_lookup_tables", ctx) as client:
+                items, count = await get_paged_items(
+                    "/referenceData/domains", client, limit=limit, start=start, filters=filters,
+                    extra_params={"sortBy": "modifiedTimeStamp:descending"})
+                return {"count": count, "lookup_tables": [
+                    {k: it.get(k) for k in ("id", "name", "label", "description",
+                                            "createdBy", "modifiedTimeStamp")}
+                    for it in items]}
+        except Exception as e:
+            return _err(e)
+
+    @mcp.tool(
+        name="sas_get_lookup_table",
+        description=(
+            "Get one SAS lookup table (reference-data domain) by id: its name plus the "
+            "key/value entries of its active content. Use sas_list_lookup_tables to find "
+            "the id."
+        ),
+    )
+    async def sas_get_lookup_table(domain_id: str, ctx: Context, limit: int = 200) -> Any:
+        try:
+            async with session("sas_get_lookup_table", ctx) as client:
+                try:
+                    dom = await get_json(f"/referenceData/domains/{domain_id}", client,
+                                         accept=_DOMAIN)
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        return {"status": "not_found", "domain_id": domain_id}
+                    raise
+                contents, _ = await get_paged_items(
+                    f"/referenceData/domains/{domain_id}/contents", client, limit=50)
+                # prefer the active content
+                active = next((c for c in contents if c.get("activationStatus") == "active"),
+                              contents[0] if contents else None)
+                entries = []
+                if active:
+                    items, _ = await get_paged_items(
+                        f"/referenceData/domains/{domain_id}/contents/{active['id']}/entries",
+                        client, limit=limit)
+                    entries = [{"key": it.get("key"), "value": it.get("value")} for it in items]
+                return {"id": dom.get("id"), "name": dom.get("name"),
+                        "label": dom.get("label"), "description": dom.get("description"),
+                        "contentId": active.get("id") if active else None,
+                        "entryCount": len(entries), "entries": entries}
+        except Exception as e:
+            return _err(e)
+
+    @mcp.tool(
+        name="sas_create_lookup_table",
+        description=(
+            "Create a new SAS Intelligent Decisioning lookup table (reference-data domain) "
+            "with a set of key/value entries, and activate it so decisions/rules can use "
+            "it. `entries` is a list of {key, value} pairs (strings). Builds the domain, "
+            "adds an active content version, and loads the entries. Returns the new "
+            "domain id."
+        ),
+    )
+    async def sas_create_lookup_table(
+        name: str, entries: list[dict], ctx: Context,
+        description: str = "", label: str | None = None,
+    ) -> Any:
+        if not entries:
+            return {"status": "invalid", "message": "Provide at least one {key, value} entry."}
+        rows = [{"key": str(e["key"]), "value": str(e.get("value", ""))}
+                for e in entries if e.get("key") is not None]
+        if not rows:
+            return {"status": "invalid", "message": "Each entry needs a 'key'."}
+        try:
+            async with session("sas_create_lookup_table", ctx) as client:
+                # 1. create the lookup domain (domainType is required)
+                dr = await client.post(
+                    f"{VIYA_ENDPOINT}/referenceData/domains",
+                    json={"name": name, "domainType": "lookup", "description": description},
+                    headers={"Content-Type": _DOMAIN, "Accept": _DOMAIN})
+                dr.raise_for_status()
+                domain_id = dr.json().get("id")
+                # 2. create a content version in an editable ('developing') status
+                cr = await client.post(
+                    f"{VIYA_ENDPOINT}/referenceData/domains/{domain_id}/contents",
+                    json={"label": label or f"{name}1.0", "status": "developing"},
+                    headers={"Content-Type": _DOMAIN_CONTENT, "Accept": _DOMAIN_CONTENT})
+                cr.raise_for_status()
+                content_id = cr.json().get("id")
+                # 3. load the key/value entries while the content is editable
+                ear = await client.post(
+                    f"{VIYA_ENDPOINT}/referenceData/domains/{domain_id}/contents/{content_id}/entries",
+                    json=rows, headers={"Content-Type": _COLLECTION, "Accept": _COLLECTION})
+                ear.raise_for_status()
+                # 4. promote the content to production so the lookup is active/usable
+                #    (status-only PUT with If-Match; activationStatus is set by SAS)
+                activated = False
+                try:
+                    cg = await client.get(
+                        f"{VIYA_ENDPOINT}/referenceData/domains/{domain_id}/contents/{content_id}",
+                        headers={"Accept": _DOMAIN_CONTENT})
+                    etag = cg.headers.get("ETag")
+                    headers = {"Content-Type": _DOMAIN_CONTENT, "Accept": _DOMAIN_CONTENT}
+                    if etag:
+                        headers["If-Match"] = etag
+                    pr = await client.put(
+                        f"{VIYA_ENDPOINT}/referenceData/domains/{domain_id}/contents/{content_id}",
+                        json={"status": "production"}, headers=headers)
+                    activated = bool(pr.is_success)
+                except httpx.HTTPError:
+                    pass
+                return {"status": "created", "id": domain_id, "name": name,
+                        "contentId": content_id, "entryCount": len(rows),
+                        "activated": activated,
+                        "message": None if activated else
+                        "Lookup created with entries but left in 'developing' status "
+                        "(activation step did not complete); activate it in SAS if needed."}
+        except Exception as e:
+            return _err(e)
+
+    # ── Custom REST node types (registered decision nodes) ─────────────────────
+
+    @mcp.tool(
+        name="sas_list_decision_node_types",
+        description=(
+            "List the registered custom decision node types — the custom REST nodes you "
+            "can drag into a Build Decisions flow (e.g. 'Segmentation Tree', 'Decision "
+            "Rest Node', 'Language Model Query'). Returns each node type's id, name, "
+            "description and (for REST nodes) the backing REST object type/uri. Use this "
+            "to discover the custom nodes available in this deployment."
+        ),
+    )
+    async def sas_list_decision_node_types(ctx: Context) -> Any:
+        try:
+            async with session("sas_list_decision_node_types", ctx) as client:
+                items, count = await get_paged_items(
+                    "/decisions/decisionNodeTypes", client, limit=200)
+                out = []
+                for it in items:
+                    entry = {k: it.get(k) for k in ("id", "name", "description", "type")}
+                    # best-effort: include the REST backing info from the type's content
+                    try:
+                        content = await get_json(
+                            f"/decisions/decisionNodeTypes/{it.get('id')}/content", client)
+                        entry["restObjectTypeName"] = content.get("restObjectTypeName")
+                        entry["restUri"] = content.get("restUri")
+                    except httpx.HTTPError:
+                        pass
+                    out.append(entry)
+                return {"count": count, "node_types": out}
         except Exception as e:
             return _err(e)

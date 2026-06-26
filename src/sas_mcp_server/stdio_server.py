@@ -46,12 +46,16 @@ import httpx
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 
+from .cas_admin_tools import register_cas_admin_tools
 from .config import CLIENT_ID, SSL_VERIFY, VIYA_ENDPOINT
 from .decision_tools import register_decision_tools
 from .exceptions import AuthenticationError
+from .forecast_tools import register_forecast_tools
 from .id_tools import register_id_tools
 from .model_tools import register_model_tools
+from .monitoring_tools import register_monitoring_tools
 from .prompts import register_prompts
+from .scheduling_tools import register_scheduling_tools
 from .tools import register_tools
 from .va_tools import InjectedArgsMiddleware, register_va_tools
 from .viya_client import logger
@@ -322,6 +326,10 @@ register_va_tools(mcp, _stdio_get_token)
 register_id_tools(mcp, _stdio_get_token)
 register_decision_tools(mcp, _stdio_get_token)
 register_model_tools(mcp, _stdio_get_token)
+register_cas_admin_tools(mcp, _stdio_get_token)
+register_scheduling_tools(mcp, _stdio_get_token)
+register_forecast_tools(mcp, _stdio_get_token)
+register_monitoring_tools(mcp, _stdio_get_token)
 register_prompts(mcp)
 
 

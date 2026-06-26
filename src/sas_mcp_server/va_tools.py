@@ -39,6 +39,8 @@ from .va.geo_builder import build_geo_coordinate, build_geo_region
 from .va.report_builder import (
     build_bar_chart_content,
     build_chart_content,
+    build_control_content,
+    build_crosstab_content,
     build_dashboard_content,
 )
 from .va.sas_client import SASViyaClient
@@ -162,10 +164,51 @@ def _validate_object_columns(real_columns: list, spec: dict, otype: str):
                 f"column '{val}' (role {key}) is text ({ctype}), but a '{otype}' "
                 "needs a numeric column there — pick a numeric column for that role"
             )
-    for role_group in _CHART_REQUIRED_ROLES.get(otype, []):
-        if not any(norm.get(r) for r in role_group):
-            label = " or ".join(role_group)
-            errors.append(f"a '{otype}' needs a column for: {label}")
+    # A crosstab built with list-form roles (row_categories / column_categories /
+    # measures) satisfies its requirements through those lists, so skip the
+    # single-form required-role check in that case.
+    has_list_roles = any(spec.get(k) for k in
+                         ("row_categories", "column_categories", "measures"))
+    if not (otype == "crosstab" and has_list_roles):
+        for role_group in _CHART_REQUIRED_ROLES.get(otype, []):
+            if not any(norm.get(r) for r in role_group):
+                label = " or ".join(role_group)
+                errors.append(f"a '{otype}' needs a column for: {label}")
+
+    # List-form roles (crosstab hierarchy): row_categories / column_categories /
+    # measures. Validate + casing-normalise each column in the list; measures
+    # must be numeric.
+    for list_key in ("row_categories", "column_categories", "measures"):
+        vals = spec.get(list_key)
+        if not vals:
+            continue
+        fixed = []
+        for v in vals:
+            real = by_lower.get(str(v).lower())
+            if not real:
+                errors.append(f"column '{v}' (in {list_key}) does not exist in the table")
+                continue
+            if list_key == "measures" and type_by_lower.get(str(v).lower()) in _CHARACTER_CAS_TYPES:
+                errors.append(f"column '{v}' (in measures) is text, but a crosstab "
+                              "measure must be numeric")
+                continue
+            fixed.append(real)
+        norm[list_key] = fixed
+
+    # Filter columns: validate + casing-normalise each filter's 'column'.
+    if spec.get("filters"):
+        norm_filters = []
+        for f in spec["filters"]:
+            f = dict(f or {})
+            col = f.get("column")
+            if col:
+                real = by_lower.get(str(col).lower())
+                if real:
+                    f["column"] = real
+                else:
+                    errors.append(f"column '{col}' (in a filter) does not exist in the table")
+            norm_filters.append(f)
+        norm["filters"] = norm_filters
     return norm, errors
 
 
@@ -263,6 +306,12 @@ def _w_create_chart(token, a):
         size_column=a.get("size_column"), size_label=a.get("size_label"),
         group_column=a.get("group_column"), group_label=a.get("group_label"),
         table_label=a.get("table_label"),
+        aggregation=a.get("aggregation"), measure_format=a.get("measure_format"),
+        calc_numerator=a.get("calc_numerator"), calc_denominator=a.get("calc_denominator"),
+        calc_op=a.get("calc_op", "div"),
+        calc_expression=a.get("calc_expression"), calc_label=a.get("calc_label"),
+        calc_format=a.get("calc_format"), calc_user_repr=a.get("calc_user_repr"),
+        filters=a.get("filters"),
     )
     try:
         c.update_report_content(report_id, content)
@@ -277,6 +326,95 @@ def _w_create_chart(token, a):
         return text, c.get_report_image(report_id)
     except Exception as img_err:
         return text + f"\n(Chart preview unavailable: {img_err})", None
+
+
+def _w_create_control(token, a):
+    c = _va(token)
+    parent_uri = _resolve_parent(c, a.get("parent_folder_uri"))
+    try:
+        real_cols = c.get_table_columns(
+            a["cas_library"], a["cas_table"], a.get("cas_server", "cas-shared-default"))
+    except Exception as col_err:
+        return (f"Could not read columns for {a['cas_library']}.{a['cas_table']} ({col_err}). "
+                "Make sure the table exists and is loaded.", None)
+    norm, errors = _validate_object_columns(real_cols, a, "list_control")
+    if not norm.get("category_column"):
+        errors.append("a control needs a 'category_column'")
+    if errors:
+        avail = ", ".join(f"{col['name']} ({col.get('type', '?')})" for col in real_cols)
+        return ("Cannot create the control — " + "; ".join(errors) + ".\n"
+                f"Available columns in {a['cas_table']}: {avail}.", None)
+    a = norm
+    report = c.create_report(a["report_name"], parent_uri)
+    report_id = report["id"]
+    content = build_control_content(
+        control_type=a["control_type"], report_name=a["report_name"],
+        cas_server=a.get("cas_server", "cas-shared-default"),
+        cas_library=a["cas_library"], cas_table=a["cas_table"],
+        category_column=a["category_column"], measure_column=a.get("measure_column"),
+        category_label=a.get("category_label"), table_label=a.get("table_label"))
+    try:
+        c.update_report_content(report_id, content)
+    except Exception:
+        try: c.delete_report(report_id)
+        except Exception: pass
+        raise
+    details = c.get_report(report_id)
+    text = (f"Control **{details.get('name', a['report_name'])}** "
+            f"({a['control_type']} on {a['category_column']}) created.\n"
+            "On its own it filters nothing — add it to a dashboard alongside charts on "
+            "the same table (sas_create_dashboard_report) to make it a page filter.\n"
+            f"Report ID: `{report_id}`\nOpen in SAS VA: {details['url']}")
+    try:
+        return text, c.get_report_image(report_id)
+    except Exception as img_err:
+        return text + f"\n(Control preview unavailable: {img_err})", None
+
+
+def _w_create_crosstab(token, a):
+    c = _va(token)
+    parent_uri = _resolve_parent(c, a.get("parent_folder_uri"))
+    try:
+        real_cols = c.get_table_columns(
+            a["cas_library"], a["cas_table"], a.get("cas_server", "cas-shared-default"))
+    except Exception as col_err:
+        return (f"Could not read columns for {a['cas_library']}.{a['cas_table']} ({col_err}). "
+                "Make sure the table exists and is loaded.", None)
+    norm, errors = _validate_object_columns(real_cols, a, "crosstab")
+    if not (norm.get("row_categories") or norm.get("column_categories")):
+        errors.append("a crosstab needs at least one column in row_categories or column_categories")
+    if not norm.get("measures"):
+        errors.append("a crosstab needs at least one column in measures")
+    if errors:
+        avail = ", ".join(f"{col['name']} ({col.get('type', '?')})" for col in real_cols)
+        return ("Cannot create the crosstab — " + "; ".join(errors) + ".\n"
+                f"Available columns in {a['cas_table']}: {avail}.", None)
+    a = norm
+    report = c.create_report(a["report_name"], parent_uri)
+    report_id = report["id"]
+    content = build_crosstab_content(
+        report_name=a["report_name"],
+        cas_server=a.get("cas_server", "cas-shared-default"),
+        cas_library=a["cas_library"], cas_table=a["cas_table"],
+        row_categories=a.get("row_categories"),
+        column_categories=a.get("column_categories"),
+        measures=a.get("measures"), table_label=a.get("table_label"),
+        measure_format=a.get("measure_format"))
+    try:
+        c.update_report_content(report_id, content)
+    except Exception:
+        try: c.delete_report(report_id)
+        except Exception: pass
+        raise
+    details = c.get_report(report_id)
+    text = (f"Crosstab **{details.get('name', a['report_name'])}** created "
+            f"(rows: {a.get('row_categories') or '—'}; columns: "
+            f"{a.get('column_categories') or '—'}; measures: {a.get('measures')}).\n"
+            f"Report ID: `{report_id}`\nOpen in SAS VA: {details['url']}")
+    try:
+        return text, c.get_report_image(report_id)
+    except Exception as img_err:
+        return text + f"\n(Crosstab preview unavailable: {img_err})", None
 
 
 def _w_create_dashboard(token, a):
@@ -309,7 +447,8 @@ def _w_create_dashboard(token, a):
     _common = dict(report_name=a["report_name"],
                    cas_server=a.get("cas_server", "cas-shared-default"),
                    cas_library=a["cas_library"], cas_table=a["cas_table"],
-                   table_label=a.get("table_label"))
+                   table_label=a.get("table_label"),
+                   link_interactions=a.get("link_interactions"))
     if pages_in:
         norm_pages = [[nobj for pi2, nobj in norm_flat if pi2 == p] for p in range(len(pages_in))]
         content = build_dashboard_content(pages=norm_pages, **_common)
@@ -969,7 +1108,14 @@ def register_va_tools(
             "omit for Frequency) + optional group_column. line → x_column + y_column (numeric). "
             "scatter → x_column + y_column (numeric). bubble → x_column + y_column + size_column "
             "(numeric). Column roles are validated against the real table before building. "
-            "Call sas_get_table_columns first to use real column names."),
+            "Call sas_get_table_columns first to use real column names.\n"
+            "Advanced: pass `calc_expression` for a CUSTOM calculated measure — a SAS VA "
+            "expression that references columns as ${Col} (a measure) or ${Col,binned} (a "
+            "category), e.g. "
+            "'minus(aggregate(average,all,${Sales}),aggregate(average,all,${Returns}))'; set "
+            "calc_label / calc_format too. Pass `filters` to filter the chart's data: a list of "
+            "{column, op, ...} where op is 'in'/'notin' (+ values:[...]), 'between' (+ min,max), "
+            "or 'greaterThan'/'lessThan'/'equals' (+ value)."),
     )
     async def sas_create_chart_report(
         chart_type: str, report_name: str, cas_library: str, cas_table: str, ctx: Context,
@@ -981,6 +1127,10 @@ def register_va_tools(
         size_column: str | None = None, size_label: str | None = None,
         group_column: str | None = None, group_label: str | None = None,
         table_label: str | None = None,
+        aggregation: str | None = None, measure_format: str | None = None,
+        calc_expression: str | None = None, calc_label: str | None = None,
+        calc_format: str | None = None, calc_user_repr: str | None = None,
+        filters: list[dict] | None = None,
     ) -> Any:
         try:
             text, png = await asyncio.to_thread(_w_create_chart, await get_token(ctx), {
@@ -990,7 +1140,11 @@ def register_va_tools(
                 "measure_column": measure_column, "measure_label": measure_label,
                 "x_column": x_column, "x_label": x_label, "y_column": y_column, "y_label": y_label,
                 "size_column": size_column, "size_label": size_label, "group_column": group_column,
-                "group_label": group_label, "table_label": table_label})
+                "group_label": group_label, "table_label": table_label,
+                "aggregation": aggregation, "measure_format": measure_format,
+                "calc_expression": calc_expression, "calc_label": calc_label,
+                "calc_format": calc_format, "calc_user_repr": calc_user_repr,
+                "filters": filters})
             return _image(text, png)
         except Exception as e:
             return _err(e)
@@ -1011,23 +1165,89 @@ def register_va_tools(
             "  scatter: {type:'scatter', x_column, y_column}; bubble: {+size_column}\n"
             "  treemap/heat_map/histogram/box_plot/waterfall/word_cloud/targeted_bar/crosstab/"
             "button_bar/list_control — see sas_list_va_object_types for their roles.\n"
+            "  control (interactive page FILTER): {type:'control', control_type:'dropdown'|"
+            "'button_bar'|'checkbox_list', category_column, measure_column?(checkbox only)}. A "
+            "control filters every other tile on the page (the tiles auto-share one data source).\n"
+            "  crosstab hierarchy: {type:'crosstab', row_categories:[...], column_categories:[...], "
+            "measures:[...]} — list >1 category on an axis to stack drill levels.\n"
             "Any measure tile also accepts aggregation (sum/average/min/max/median) and "
-            "measure_format (currency/comma/percent or a raw SAS format), or a calculated ratio "
-            "via calc_numerator + calc_denominator (+ calc_op). For tabs, pass `pages` (a list "
-            "of pages, each a list of tiles) instead of `objects`. Columns are validated against "
-            "the real table first — call sas_get_table_columns to use real names."),
+            "measure_format (currency/comma/percent or a raw SAS format), a calculated ratio via "
+            "calc_numerator + calc_denominator (+ calc_op), or a custom calc_expression (e.g. "
+            "'minus(aggregate(average,all,${Sales}),aggregate(average,all,${Returns}))'). Any "
+            "tile accepts `filters` (list of {column, op, values/min/max/value}). "
+            "link_interactions=True makes charts cross-filter each other (linked selection); it "
+            "is automatic when a control tile is present. For tabs, pass `pages` (a list of pages, "
+            "each a list of tiles) instead of `objects`. Columns are validated against the real "
+            "table first — call sas_get_table_columns to use real names."),
     )
     async def sas_create_dashboard_report(
         report_name: str, cas_library: str, cas_table: str, ctx: Context,
         parent_folder_uri: str = "@myFolder", cas_server: str = "cas-shared-default",
         table_label: str | None = None,
         objects: list[dict] | None = None, pages: list[list[dict]] | None = None,
+        link_interactions: bool | None = None,
     ) -> Any:
         try:
             text, png = await asyncio.to_thread(_w_create_dashboard, await get_token(ctx), {
                 "report_name": report_name, "cas_library": cas_library, "cas_table": cas_table,
                 "parent_folder_uri": parent_folder_uri, "cas_server": cas_server,
-                "table_label": table_label, "objects": objects, "pages": pages})
+                "table_label": table_label, "objects": objects, "pages": pages,
+                "link_interactions": link_interactions})
+            return _image(text, png)
+        except Exception as e:
+            return _err(e)
+
+    @mcp.tool(
+        name="sas_create_control_report",
+        description=(
+            "Create a SAS Visual Analytics interactive CONTROL (prompt) — a drop-down list, "
+            "button bar, or checkbox list over a category column. control_type: 'dropdown' | "
+            "'button_bar' | 'checkbox_list'. checkbox_list can also show a measure_column. On its "
+            "own a control filters nothing; add it to a dashboard (sas_create_dashboard_report "
+            "with a {type:'control', ...} tile) alongside charts on the same table to turn it into "
+            "a page filter. Call sas_get_table_columns first to use a real category_column."),
+    )
+    async def sas_create_control_report(
+        control_type: str, report_name: str, cas_library: str, cas_table: str,
+        category_column: str, ctx: Context,
+        parent_folder_uri: str = "@myFolder", cas_server: str = "cas-shared-default",
+        measure_column: str | None = None, category_label: str | None = None,
+        table_label: str | None = None,
+    ) -> Any:
+        try:
+            text, png = await asyncio.to_thread(_w_create_control, await get_token(ctx), {
+                "control_type": control_type, "report_name": report_name,
+                "cas_library": cas_library, "cas_table": cas_table,
+                "parent_folder_uri": parent_folder_uri, "cas_server": cas_server,
+                "category_column": category_column, "measure_column": measure_column,
+                "category_label": category_label, "table_label": table_label})
+            return _image(text, png)
+        except Exception as e:
+            return _err(e)
+
+    @mcp.tool(
+        name="sas_create_crosstab",
+        description=(
+            "Create a SAS Visual Analytics CROSSTAB (pivot table) report with optional row/column "
+            "HIERARCHIES. row_categories and column_categories are ordered lists of category "
+            "columns — list more than one on an axis to stack drill-down levels (e.g. "
+            "row_categories=['Region','State']). measures is one or more numeric columns shown in "
+            "the cells. Columns are validated against the real table — call sas_get_table_columns "
+            "first."),
+    )
+    async def sas_create_crosstab(
+        report_name: str, cas_library: str, cas_table: str, ctx: Context,
+        row_categories: list[str] | None = None, column_categories: list[str] | None = None,
+        measures: list[str] | None = None,
+        parent_folder_uri: str = "@myFolder", cas_server: str = "cas-shared-default",
+        table_label: str | None = None, measure_format: str | None = None,
+    ) -> Any:
+        try:
+            text, png = await asyncio.to_thread(_w_create_crosstab, await get_token(ctx), {
+                "report_name": report_name, "cas_library": cas_library, "cas_table": cas_table,
+                "parent_folder_uri": parent_folder_uri, "cas_server": cas_server,
+                "row_categories": row_categories, "column_categories": column_categories,
+                "measures": measures, "table_label": table_label, "measure_format": measure_format})
             return _image(text, png)
         except Exception as e:
             return _err(e)

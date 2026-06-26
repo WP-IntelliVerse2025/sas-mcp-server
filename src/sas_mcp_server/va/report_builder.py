@@ -86,6 +86,234 @@ def _bi_calc(name: str, label: str, num_alias: str, den_alias: str,
     return d
 
 
+# Friendly aggregation-context words accepted in a calc expression's ${Col|agg|ctx}
+# token.  SAS uses 'all' (across every row) and 'group' (within the visual's
+# grouping) as the second argument of aggregate(...).
+_CALC_CONTEXTS = {"forall": "all", "all": "all", "bygroup": "group", "group": "group"}
+# Aggregation function names usable inside a calc expression.
+_CALC_AGGS = {"sum", "average", "avg", "mean", "min", "max", "median",
+              "count", "countdistinct", "stddev"}
+
+
+def _parse_calc_expression(expression: str, start_index: int = 900):
+    """Translate a *friendly* VA calculation expression into a BIRD expression.
+
+    Columns are referenced as ``${ColumnName}`` (a measure, emitted as ``,raw``)
+    or ``${ColumnName,binned}`` (a category).  Each distinct column becomes a
+    DataItem named ``biNNN`` (digit names — SAS's expression parser rejects the
+    underscore aliases elsewhere in the model inside ``${...}``) and the token is
+    rewritten to ``${biNNN,<modifier>}``.
+
+    Returns ``(rewritten_expression, [DataItem, ...], {column: bi_name})``.
+
+    Example::
+
+        minus(aggregate(average,all,${Sales}),aggregate(average,all,${Returns}))
+    """
+    items: list = []
+    col_to_bi: dict = {}
+    counter = [start_index]
+
+    def repl(m: "re.Match") -> str:
+        inner = m.group(1)
+        parts = [p.strip() for p in inner.split(",")]
+        col = parts[0]
+        modifier = parts[1] if len(parts) > 1 and parts[1] else "raw"
+        if col not in col_to_bi:
+            name = f"bi{counter[0]}"
+            counter[0] += 1
+            usage = "categorical" if modifier == "binned" else "quantitative"
+            items.append(_bi_item(name, col, col, usage))
+            col_to_bi[col] = name
+        return "${" + col_to_bi[col] + "," + modifier + "}"
+
+    rewritten = re.sub(r"\$\{([^}]+)\}", repl, expression)
+    return rewritten, items, col_to_bi
+
+
+def _bi_calc_expr(name: str, label: str, expression: str,
+                  fmt: Optional[str] = None, user_repr: Optional[str] = None) -> dict:
+    """An ``AggregateCalculatedItem`` from a fully-formed BIRD ``expression``
+    (already rewritten to ``${biNNN,...}`` refs).  Mirrors a SAS-VA-authored
+    calculated measure: name/label/format/dataType/expression, plus an optional
+    ``USER_EDIT_REPRESENTATION`` editor property carrying the human formula."""
+    d = {"name": name, "label": label, "@element": "AggregateCalculatedItem",
+         "dataType": "double",
+         "expression": {"@element": "Expression", "value": expression}}
+    f = _norm_format(fmt)
+    if f:
+        d["format"] = f
+    if user_repr:
+        d["editorProperties"] = [{
+            "@element": "Editor_Property",
+            "key": "USER_EDIT_REPRESENTATION", "value": user_repr}]
+    return d
+
+
+def _calc_measure_items(calc_expression: str, label: str,
+                        fmt: Optional[str] = None, user_repr: Optional[str] = None,
+                        meas_name: str = "bi_meas") -> list:
+    """Build the data-source business items for a custom calculated measure: the
+    per-column source DataItems referenced by the expression plus the
+    ``AggregateCalculatedItem`` named *meas_name* (so it slots into the existing
+    ``bi_meas`` measure alias path)."""
+    expr, src_items, _ = _parse_calc_expression(calc_expression)
+    calc_item = _bi_calc_expr(meas_name, label, expr, fmt,
+                              user_repr or calc_expression)
+    return src_items + [calc_item]
+
+
+# ── filters ───────────────────────────────────────────────────────────────────
+# A filter is applied to a ParentDataDefinition via an AppliedFilters block that
+# references filter business items also stored on that data definition.  A
+# RelationalFilterItem (detail filter) filters category VALUES; an
+# AggregateFilterItem filters by a measure RANGE/comparison.  Both reference a
+# RelationalDataItem alias (digit-named) over the filtered source column.
+
+# op -> (filter element, value modifier, is_aggregate)
+_FILTER_OPS = {
+    "in":          ("RelationalFilterItem", "binned", False),
+    "notin":       ("RelationalFilterItem", "binned", False),
+    "between":     ("AggregateFilterItem",  "raw",    True),
+    "greaterthan": ("AggregateFilterItem",  "raw",    True),
+    "lessthan":    ("AggregateFilterItem",  "raw",    True),
+    "greaterthanorequals": ("AggregateFilterItem", "raw", True),
+    "lessthanorequals":    ("AggregateFilterItem", "raw", True),
+    "equals":      ("AggregateFilterItem",  "raw",    True),
+}
+
+
+def _sas_str_list(values: list) -> str:
+    """Render python values as the SAS quoted, comma-joined argument list used
+    inside ``in(...)`` — strings single-quoted (and SAS-escaped), numbers bare."""
+    out = []
+    for v in values:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out.append(str(v))
+        else:
+            out.append("'" + str(v).replace("'", "''") + "'")
+    return ",".join(out)
+
+
+def _build_filters(filters: list, start_index: int = 800):
+    """Translate friendly filter specs into BIRD filter machinery.
+
+    Each spec is a dict::
+
+        {"column": "State", "op": "in", "values": ["Assam", "Goa"]}
+        {"column": "Age",   "op": "between", "min": 29, "max": 46}
+        {"column": "Sales", "op": "greaterThan", "value": 1000}
+
+    ``include_missing`` (default True) wraps the predicate in
+    ``or(<pred>, ismissing(<ref>))`` exactly as SAS VA does so rows with missing
+    values are not silently dropped.
+
+    Returns ``(source_items, aliases, filter_items, applied_filters)`` where
+    *source_items* are DataItems (add to the data source's businessItemFolder),
+    *aliases* are RelationalDataItems (add to the ParentDataDefinition's
+    businessItems), *filter_items* are the Relational/Aggregate filter items
+    (also businessItems of the ParentDataDefinition), and *applied_filters* is
+    the ``AppliedFilters`` dict (or ``None`` when *filters* is empty).
+    """
+    source_items: list = []
+    aliases: list = []
+    filter_items: list = []
+    detail_names: list = []
+    aggregate_names: list = []
+    counter = [start_index]
+
+    for spec in filters or []:
+        spec = dict(spec)
+        col = spec.get("column")
+        op = str(spec.get("op", "in")).strip().lower()
+        if not col:
+            raise ValueError("Each filter needs a 'column'.")
+        if op not in _FILTER_OPS:
+            raise ValueError(
+                f"Unknown filter op '{op}'. Valid: {sorted(_FILTER_OPS)}")
+        element, modifier, is_agg = _FILTER_OPS[op]
+        include_missing = spec.get("include_missing", True)
+
+        src_name = f"bi{counter[0]}"
+        ali_name = f"bi{counter[0] + 1}"
+        flt_name = f"bi{counter[0] + 2}"
+        counter[0] += 3
+
+        usage = "quantitative" if is_agg else "categorical"
+        source_items.append(_bi_item(src_name, col, col, usage))
+        aliases.append(_alias(ali_name, src_name))
+
+        ref = "${" + ali_name + "," + modifier + "}"
+        if op in ("in", "notin"):
+            values = spec.get("values") or []
+            if not values:
+                raise ValueError(f"Filter on '{col}' with op '{op}' needs 'values'.")
+            pred = f"in({ref},{_sas_str_list(values)})"
+            if op == "notin":
+                pred = f"not({pred})"
+        elif op == "between":
+            lo, hi = spec.get("min"), spec.get("max")
+            if lo is None or hi is None:
+                raise ValueError(f"Filter on '{col}' with op 'between' needs 'min' and 'max'.")
+            pred = f"between({ref},{lo},{hi})"
+        else:
+            val = spec.get("value")
+            if val is None:
+                raise ValueError(f"Filter on '{col}' with op '{op}' needs 'value'.")
+            sas_op = {"greaterthan": "greaterThan", "lessthan": "lessThan",
+                      "greaterthanorequals": "greaterThanOrEquals",
+                      "lessthanorequals": "lessThanOrEquals",
+                      "equals": "eq"}[op]
+            val_s = _sas_str_list([val])
+            pred = f"{sas_op}({ref},{val_s})"
+
+        expr = f"or({pred},ismissing({ref}))" if include_missing else pred
+        filter_items.append({
+            "name": flt_name,
+            "expression": {"@element": "Expression", "value": expr},
+            "editorProperties": [
+                {"@element": "Editor_Property", "key": "complexity",
+                 "value": "SINGLE_DATA_ITEM"},
+                {"@element": "Editor_Property", "key": "interactiveEditingAllowed",
+                 "value": "TRUE"},
+            ],
+            "@element": element,
+        })
+        (aggregate_names if is_agg else detail_names).append(flt_name)
+
+    applied = None
+    if filter_items:
+        applied = {"@element": "AppliedFilters"}
+        if aggregate_names:
+            applied["aggregateFilters"] = aggregate_names
+        if detail_names:
+            applied["detailFilters"] = detail_names
+    return source_items, aliases, filter_items, applied
+
+
+def apply_filters(content: dict, filters: Optional[list],
+                  start_index: int = 800) -> dict:
+    """Post-process an assembled single-object report, applying *filters* to it.
+
+    Adds the filter source DataItems to the data source's businessItemFolder and
+    the RelationalDataItem aliases + Relational/Aggregate FilterItems and the
+    ``AppliedFilters`` block to the (first) ParentDataDefinition. Mutates and
+    returns *content*. A no-op when *filters* is falsy."""
+    if not filters:
+        return content
+    src, ali, fitems, applied = _build_filters(filters, start_index)
+    if not applied:
+        return content
+    content["dataSources"][0]["businessItemFolder"]["items"].extend(src)
+    # The ParentDataDefinition is the first data definition (dd1 for charts).
+    pdd = next((d for d in content["dataDefinitions"]
+                if d.get("@element") == "ParentDataDefinition"),
+               content["dataDefinitions"][0])
+    pdd["businessItems"] = pdd.get("businessItems", []) + ali + fitems
+    pdd["appliedFilters"] = applied
+    return content
+
+
 def _bi_item(name: str, label: str, column: str, usage: str = "categorical",
              aggregation: Optional[str] = None, fmt: Optional[str] = None) -> dict:
     d = {"@element": "DataItem", "name": name, "label": label,
@@ -577,6 +805,8 @@ def _assemble(
     extra_editor_props: Optional[list] = None,
     table_columns: Optional[list] = None,    # Table_Column dicts for pie
     table_interactions: Optional[list] = None,
+    filter_items: Optional[list] = None,      # Relational/Aggregate FilterItem dicts
+    applied_filters: Optional[dict] = None,   # AppliedFilters block (or None)
 ) -> dict:
     return {
         "@element": "SASReport",
@@ -592,9 +822,10 @@ def _assemble(
         "dataDefinitions": [{
             "@element": "ParentDataDefinition",
             "name": "dd1",
-            "businessItems": dd1_bis,
+            "businessItems": dd1_bis + (filter_items or []),
             "source": "ds1",
             "childQueryRelationshipType": "independent",
+            **({"appliedFilters": applied_filters} if applied_filters else {}),
             "dataDefinitionList": [{
                 "@element": "DataDefinition",
                 "name": "dd2",
@@ -804,6 +1035,64 @@ def build_chart_content(
     calc_numerator: Optional[str] = None,
     calc_denominator: Optional[str] = None,
     calc_op: str = "div",
+    # custom calculated measure — a friendly VA expression that references
+    # columns as ${Col} / ${Col,binned} (e.g.
+    #   "minus(aggregate(average,all,${Sales}),aggregate(average,all,${Returns}))")
+    calc_expression: Optional[str] = None,
+    calc_label: Optional[str] = None,
+    calc_format: Optional[str] = None,
+    calc_user_repr: Optional[str] = None,
+    # data filters applied to this object (see _build_filters for the spec shape)
+    filters: Optional[list] = None,
+) -> dict:
+    """Build a chart report, then apply any *filters* (post-process).
+
+    Thin public wrapper over :func:`_build_chart_content` so data filters compose
+    with every chart type without threading them through each branch."""
+    content = _build_chart_content(
+        chart_type=chart_type, report_name=report_name, cas_server=cas_server,
+        cas_library=cas_library, cas_table=cas_table,
+        category_column=category_column, category_label=category_label,
+        measure_column=measure_column, measure_label=measure_label,
+        x_column=x_column, x_label=x_label, y_column=y_column, y_label=y_label,
+        size_column=size_column, size_label=size_label,
+        group_column=group_column, group_label=group_label, table_label=table_label,
+        aggregation=aggregation, measure_format=measure_format,
+        calc_numerator=calc_numerator, calc_denominator=calc_denominator, calc_op=calc_op,
+        calc_expression=calc_expression, calc_label=calc_label,
+        calc_format=calc_format, calc_user_repr=calc_user_repr,
+    )
+    return apply_filters(content, filters)
+
+
+def _build_chart_content(
+    chart_type: str,
+    report_name: str,
+    cas_server: str,
+    cas_library: str,
+    cas_table: str,
+    category_column: Optional[str] = None,
+    category_label: Optional[str] = None,
+    measure_column: Optional[str] = None,
+    measure_label: Optional[str] = None,
+    x_column: Optional[str] = None,
+    x_label: Optional[str] = None,
+    y_column: Optional[str] = None,
+    y_label: Optional[str] = None,
+    size_column: Optional[str] = None,
+    size_label: Optional[str] = None,
+    group_column: Optional[str] = None,
+    group_label: Optional[str] = None,
+    table_label: Optional[str] = None,
+    aggregation: Optional[str] = None,
+    measure_format: Optional[str] = None,
+    calc_numerator: Optional[str] = None,
+    calc_denominator: Optional[str] = None,
+    calc_op: str = "div",
+    calc_expression: Optional[str] = None,
+    calc_label: Optional[str] = None,
+    calc_format: Optional[str] = None,
+    calc_user_repr: Optional[str] = None,
 ) -> dict:
     """
     Build a SASReport BIRD 4.64.0 JSON document for the requested chart type.
@@ -831,9 +1120,12 @@ def build_chart_content(
         cat_lbl = category_label or cat_col
         has_grp = bool(group_column and group_column != cat_col)
         grp_lbl = group_label or (group_column if has_grp else cat_lbl)
+        has_calc_expr = bool(calc_expression)
         has_calc = bool(calc_numerator and calc_denominator)
-        use_freq = not (bool(measure_column) or has_calc)
-        if has_calc:
+        use_freq = not (bool(measure_column) or has_calc or has_calc_expr)
+        if has_calc_expr:
+            meas_lbl = calc_label or measure_label or "Calculation"
+        elif has_calc:
             meas_lbl = measure_label or f"{calc_numerator}/{calc_denominator}"
         else:
             meas_lbl = measure_label or (measure_column if measure_column else "Frequency")
@@ -843,7 +1135,10 @@ def build_chart_content(
             _bi_freq(),
             _bi_freq_pct(),
         ]
-        if has_calc:
+        if has_calc_expr:
+            bi_items.extend(_calc_measure_items(
+                calc_expression, meas_lbl, calc_format or measure_format, calc_user_repr))
+        elif has_calc:
             # A calculated ratio measure references two source columns. The two
             # source items MUST use bi+digit names (bi991/bi992) — SAS's
             # expression parser rejects underscore names inside ${...,raw}.
@@ -1099,6 +1394,319 @@ def build_chart_content(
     )
 
 
+# ── interactive control prompts (drop-down / checkbox list / button bar) ─────
+# A control is a section Prompt that filters every peer object sharing its data
+# source (the report-wide implicitInteractions enable sectionPrompt brushing).
+# control_type -> (promptVisual element, maxRowsLookup, label prefix,
+#                  selection_disabled, needs_measure)
+_CONTROL_TYPES = {
+    "dropdown":      ("ComboBox",     "dropdown",  "Drop-down list", True,  False),
+    "combobox":      ("ComboBox",     "dropdown",  "Drop-down list", True,  False),
+    "button_bar":    ("LinkBar",      "buttonBar", "Button bar",     True,  False),
+    "buttonbar":     ("LinkBar",      "buttonBar", "Button bar",     True,  False),
+    "checkbox_list": ("CheckBoxList", "list",      "List",           False, True),
+    "checkbox":      ("CheckBoxList", "list",      "List",           False, True),
+    "list":          ("CheckBoxList", "list",      "List",           False, True),
+}
+
+
+def _media_scaffolding() -> dict:
+    """The mediaSchemes / mediaTargets / history / sasReportState blocks shared by
+    every report variant (identical to the ones _assemble emits)."""
+    now = _now()
+    return {
+        "mediaSchemes": [{
+            "@element": "MediaScheme", "name": "ms1",
+            "baseStylesheetResource": {
+                "@element": "BaseStylesheetResource", "theme": "light2025"},
+            "stylesheet": {"@element": "Stylesheet", "styles": {}},
+        }],
+        "mediaTargets": [
+            {"@element": "MediaTarget", "name": "mt_default",
+             "windowSize": "default", "scheme": "ms1"},
+            {"@element": "MediaTarget", "name": "mt_small",
+             "windowSize": "small", "scheme": "ms1"},
+            {"@element": "MediaTarget", "name": "mt_medium",
+             "windowSize": "medium", "scheme": "ms1"},
+            {"@element": "MediaTarget", "name": "mt_large",
+             "windowSize": "large", "scheme": "ms1"},
+        ],
+        "history": {
+            "@element": "History",
+            "editors": [{
+                "@element": "Editor", "applicationName": "VA",
+                "revisions": [{"@element": "Revision", "editorVersion": "2020",
+                               "lastDate": now}],
+            }],
+        },
+        "sasReportState": {
+            "@element": "SASReportState", "view": {"@element": "View_State"}},
+    }
+
+
+def build_control_data(control_type: str, cas_server: str, cas_library: str,
+                       cas_table: str, category_column: str,
+                       measure_column: Optional[str] = None, table_label: Optional[str] = None,
+                       suffix: str = "c", category_label: Optional[str] = None):
+    """Build the data source + ParentDataDefinition + Prompt visual for one
+    control, returning ``(data_source, data_definition, prompt_visual)``.
+
+    Names are suffixed with *suffix* so multiple controls (and other objects)
+    can coexist in one report without colliding. The Prompt's
+    ``sourceInteractionVariableList`` carries the value variable so VA brushes
+    every peer object that shares this data source when a value is selected.
+    """
+    ct = str(control_type).lower().strip()
+    if ct not in _CONTROL_TYPES:
+        raise ValueError(
+            f"Unknown control_type '{control_type}'. Valid: {sorted(_CONTROL_TYPES)}")
+    element, max_rows, label_prefix, selection_disabled, needs_measure = _CONTROL_TYPES[ct]
+    if not category_column:
+        raise ValueError(f"{control_type} control requires a category_column")
+
+    ds = f"ds{suffix}"
+    val_src, val_ali = f"bival{suffix}", f"bivalr{suffix}"
+    dd1, dd2, dd_res = f"dd{suffix}", f"ddq{suffix}", f"ddres{suffix}"
+    ve = f"vectl{suffix}"
+    cat_lbl = category_label or category_column
+
+    source_items = [_bi_item(val_src, cat_lbl, category_column, "categorical")]
+    bi_items = [_alias(val_ali, val_src)]
+    axis_items = [val_ali]
+    prompt_visual = {"@element": element, "valueVariable": val_ali}
+
+    if needs_measure and measure_column:
+        meas_src, meas_ali = f"bimea{suffix}", f"bimear{suffix}"
+        source_items.append(_bi_item(meas_src, measure_column, measure_column, "quantitative"))
+        bi_items.insert(0, _alias(meas_ali, meas_src))
+        axis_items = [meas_ali, val_ali]   # measure first, then value (HAR order)
+        prompt_visual["measureVariable"] = meas_ali
+
+    data_source = {
+        "@element": "DataSource", "name": ds, "label": table_label or cas_table,
+        "type": "relational",
+        "casResource": {"@element": "CasResource", "server": cas_server,
+                        "library": cas_library, "table": cas_table, "locale": "en_US"},
+        "businessItemFolder": {"@element": "BusinessItemFolder", "items": source_items},
+    }
+    data_definition = {
+        "@element": "ParentDataDefinition", "name": dd1, "businessItems": bi_items,
+        "source": ds, "childQueryRelationshipType": "independent",
+        "dataDefinitionList": [{
+            "@element": "DataDefinition", "name": dd2, "type": "relational",
+            "relationalQueryList": [{
+                "@element": "RelationalQuery",
+                "sortItems": [{"@element": "SortItem", "sortDirection": "ascending",
+                               "reference": val_ali}],
+                "axes": [{"@element": "Query_Axis", "type": "column", "itemList": axis_items}],
+            }],
+            "source": ds,
+            "resultDefinitions": [{
+                "@element": "ResultDefinition", "name": dd_res, "purpose": "primary",
+                "maxRowsBehavior": "truncate", "maxRowsLookup": max_rows}],
+        }],
+        "status": "executable",
+    }
+    editor_props = [
+        {"@element": "Editor_Property", "key": "autoChartCategory", "value": "CONTROL"},
+        {"@element": "Editor_Property", "key": "isAutoLabel", "value": "true"},
+    ]
+    prompt = {
+        "@element": "Prompt", "name": ve, "data": dd1,
+        "applyDynamicBrushes": "promptsOnly",
+        "labelAttribute": f"{label_prefix} - {cat_lbl} 1",
+        **({"selectionDisabled": "true"} if selection_disabled else {}),
+        "sourceInteractionVariableList": [val_ali],
+        "editorProperties": editor_props,
+        "resultDefinitionList": [dd_res],
+        "promptVisual": prompt_visual,
+    }
+    return data_source, data_definition, prompt
+
+
+def build_control_content(control_type: str, report_name: str, cas_server: str,
+                          cas_library: str, cas_table: str, category_column: str,
+                          measure_column: Optional[str] = None,
+                          category_label: Optional[str] = None,
+                          table_label: Optional[str] = None) -> dict:
+    """Build a one-control SAS VA report (a drop-down / checkbox list / button
+    bar prompt over *category_column*). On its own it filters nothing; placed in
+    a dashboard alongside charts on the same table it becomes a page filter."""
+    table_label = table_label or cas_table
+    ds, dd, prompt = build_control_data(
+        control_type, cas_server, cas_library, cas_table, category_column,
+        measure_column, table_label, suffix="1", category_label=category_label)
+    report = {
+        "@element": "SASReport",
+        "xmlns": "http://www.sas.com/sasreportmodel/bird-4.64.0",
+        "label": report_name,
+        "createdApplicationName": "SAS Visual Analytics",
+        "dateModified": _now(),
+        "lastModifiedApplicationName": "SAS Visual Analytics",
+        "createdLocale": "en_US",
+        "features": ["promptModelV2"],
+        "implicitInteractions": ["reportPrompt", "sectionPrompt", "sectionLink"],
+        "nextUniqueNameIndex": 20,
+        "dataDefinitions": [dd],
+        "dataSources": [ds],
+        "visualElements": [prompt],
+        "view": {"@element": "View", "sections": [{
+            "@element": "Section", "name": "vi1", "label": "Page 1",
+            "body": {"@element": "Body", "mediaContainerList": [{
+                "@element": "MediaContainer", "target": "mt_default",
+                "layout": {"@element": "ResponsiveLayout", "orientation": "vertical",
+                           "overflow": "fit", "weights": _weights([100])},
+                "containedElementList": [_dash_visual("vi2", prompt["name"])],
+            }]},
+        }]},
+        "properties": [{"@element": "Property", "key": "displayDataSource",
+                        "value": ds["name"]}],
+        **_media_scaffolding(),
+    }
+    return report
+
+
+# ── crosstab with row/column hierarchies ─────────────────────────────────────
+
+def build_crosstab_data(cas_server: str, cas_library: str, cas_table: str,
+                        row_categories: list, column_categories: Optional[list] = None,
+                        measures: Optional[list] = None, table_label: Optional[str] = None,
+                        measure_format: Optional[str] = None, suffix: str = "x"):
+    """Build the data source + ParentDataDefinition + Crosstab visual for a
+    crosstab whose row and/or column axis may stack SEVERAL category columns
+    (a drill hierarchy), with one or more measures. Returns
+    ``(data_source, data_definition, crosstab_visual)`` with *suffix*-tagged names."""
+    row_categories = [c for c in (row_categories or []) if c]
+    column_categories = [c for c in (column_categories or []) if c]
+    measures = [m for m in (measures or []) if m]
+    if not (row_categories or column_categories):
+        raise ValueError("crosstab needs at least one row or column category")
+    if not measures:
+        raise ValueError("crosstab needs at least one measure_column")
+
+    ds = f"ds{suffix}"
+    dd1, dd2, dd_res = f"dd{suffix}", f"ddq{suffix}", f"ddres{suffix}"
+    source_items: list = []
+    bi_items: list = []
+    n = [0]
+
+    def make(col: str, usage: str) -> str:
+        n[0] += 1
+        src, ali = f"bisrc{suffix}_{n[0]}", f"bi{suffix}{n[0]}"
+        fmt = measure_format if usage == "quantitative" else None
+        source_items.append(_bi_item(src, col, col, usage, fmt=fmt))
+        bi_items.append(_alias(ali, src))
+        return ali
+
+    col_cat_aliases = [make(c, "categorical") for c in column_categories]
+    row_cat_aliases = [make(c, "categorical") for c in row_categories]
+    meas_aliases = [make(m, "quantitative") for m in measures]
+
+    # Crosstab visual axes: each category becomes a Crosstab_Hierarchy level; the
+    # measures sit in a single Measures block on the column axis.
+    v = [0]
+
+    def vename() -> str:
+        v[0] += 1
+        return f"ve{suffix}{v[0]}"
+
+    col_dims = [{"@element": "Crosstab_Hierarchy", "name": vename(), "variable": a}
+                for a in col_cat_aliases]
+    col_dims.append({"@element": "Measures", "measureList": [
+        {"@element": "Crosstab_Measure", "name": vename(), "variable": a,
+         "compactFormat": False} for a in meas_aliases]})
+    row_dims = [{"@element": "Crosstab_Hierarchy", "name": vename(), "variable": a}
+                for a in row_cat_aliases]
+
+    col_items = col_cat_aliases + meas_aliases
+    query_axes = [_axis("column", col_items)]
+    if row_cat_aliases:
+        query_axes.append(_axis("row", row_cat_aliases))
+
+    mdq = {"@element": "MultidimensionalQuery", "axes": query_axes,
+           "rowSubtotals": False, "columnSubtotals": False}
+    if row_cat_aliases:
+        mdq["rowSortItems"] = [{"@element": "SortItem", "sortDirection": "descending",
+                                "reference": row_cat_aliases[0]}]
+    if col_cat_aliases:
+        mdq["columnSortItems"] = [_sort_asc(col_cat_aliases[0])]
+
+    data_source = {
+        "@element": "DataSource", "name": ds, "label": table_label or cas_table,
+        "type": "relational",
+        "casResource": {"@element": "CasResource", "server": cas_server,
+                        "library": cas_library, "table": cas_table, "locale": "en_US"},
+        "businessItemFolder": {"@element": "BusinessItemFolder", "items": source_items},
+    }
+    data_definition = {
+        "@element": "ParentDataDefinition", "name": dd1, "businessItems": bi_items,
+        "source": ds, "childQueryRelationshipType": "independent",
+        "dataDefinitionList": [{
+            "@element": "DataDefinition", "name": dd2, "type": "multidimensional",
+            "multidimensionalQueryList": [mdq], "source": ds,
+            "resultDefinitions": [{
+                "@element": "ResultDefinition", "name": dd_res, "purpose": "primary",
+                "maxRowsBehavior": "noData", "maxRowsLookup": "crosstab"}],
+        }],
+        "status": "executable",
+    }
+    crosstab = {
+        "@element": "Crosstab", "name": f"vect{suffix}", "data": dd1,
+        "applyDynamicBrushes": "yes", "labelAttribute": "Crosstab 1",
+        "sourceInteractionVariableList": col_cat_aliases + row_cat_aliases,
+        "editorProperties": [{"@element": "Editor_Property", "key": "isAutoLabel",
+                              "value": "true"}],
+        "resultDefinitionList": [dd_res], "measureSizing": "autoFill",
+        "axes": [
+            {"@element": "Crosstab_Axis", "type": "column", "dimensionList": col_dims},
+            {"@element": "Crosstab_Axis", "type": "row", "dimensionList": row_dims},
+        ],
+    }
+    return data_source, data_definition, crosstab
+
+
+def build_crosstab_content(report_name: str, cas_server: str, cas_library: str,
+                           cas_table: str, row_categories: list,
+                           column_categories: Optional[list] = None,
+                           measures: Optional[list] = None,
+                           table_label: Optional[str] = None,
+                           measure_format: Optional[str] = None) -> dict:
+    """Build a one-crosstab SAS VA report. *row_categories* / *column_categories*
+    are ordered lists — pass more than one to stack drill levels (a hierarchy) on
+    that axis; *measures* is one or more measure columns shown in the cells."""
+    table_label = table_label or cas_table
+    ds, dd, crosstab = build_crosstab_data(
+        cas_server, cas_library, cas_table, row_categories, column_categories,
+        measures, table_label, measure_format, suffix="1")
+    return {
+        "@element": "SASReport",
+        "xmlns": "http://www.sas.com/sasreportmodel/bird-4.64.0",
+        "label": report_name,
+        "createdApplicationName": "SAS Visual Analytics",
+        "dateModified": _now(),
+        "lastModifiedApplicationName": "SAS Visual Analytics",
+        "createdLocale": "en_US",
+        "features": ["promptModelV2"],
+        "implicitInteractions": ["reportPrompt", "sectionPrompt", "sectionLink"],
+        "nextUniqueNameIndex": 20,
+        "dataDefinitions": [dd],
+        "dataSources": [ds],
+        "visualElements": [crosstab],
+        "view": {"@element": "View", "sections": [{
+            "@element": "Section", "name": "vi1", "label": "Page 1",
+            "body": {"@element": "Body", "mediaContainerList": [{
+                "@element": "MediaContainer", "target": "mt_default",
+                "layout": {"@element": "ResponsiveLayout", "orientation": "vertical",
+                           "overflow": "fit", "weights": _weights([100])},
+                "containedElementList": [_dash_visual("vi2", crosstab["name"])],
+            }]},
+        }]},
+        "properties": [{"@element": "Property", "key": "displayDataSource",
+                        "value": ds["name"]}],
+        **_media_scaffolding(),
+    }
+
+
 # ── dashboard (multiple KPIs + charts in one report) ─────────────────────────
 
 # Chart object types handled by build_chart_content; anything else is treated as
@@ -1114,6 +1722,44 @@ def _catalog_types() -> set:
     containers. Lazy import to avoid a module-load cycle."""
     from .va_objects import _ROLE_PARAMS, _CONTAINER_TYPES
     return (set(_ROLE_PARAMS) - {"key_value"}) - set(_CONTAINER_TYPES)
+
+
+def _merge_data_sources(data_sources: list, data_definitions: list):
+    """Collapse DataSources that point at the SAME CAS table (server/library/table)
+    into one, concatenating their business items and rewriting every ``source``
+    reference in *data_definitions* to the surviving name.
+
+    A shared data source is what lets a section prompt (control) brush its peer
+    objects and lets charts cross-filter each other (linked selection). Returns
+    ``(merged_sources, rename_map)``; *data_definitions* is mutated in place."""
+    by_key: dict = {}
+    rename: dict = {}
+    merged: list = []
+    for ds in data_sources:
+        cr = ds.get("casResource", {})
+        key = (cr.get("server"), cr.get("library"), cr.get("table"))
+        if key in by_key:
+            canon = by_key[key]
+            rename[ds["name"]] = canon["name"]
+            canon["businessItemFolder"]["items"].extend(
+                ds.get("businessItemFolder", {}).get("items", []))
+        else:
+            by_key[key] = ds
+            merged.append(ds)
+
+    if rename:
+        def rewrite(node):
+            if isinstance(node, dict):
+                src = node.get("source")
+                if isinstance(src, str) and src in rename:
+                    node["source"] = rename[src]
+                for v in node.values():
+                    rewrite(v)
+            elif isinstance(node, list):
+                for v in node:
+                    rewrite(v)
+        rewrite(data_definitions)
+    return merged, rename
 
 
 def _collect_names(node, acc: set) -> None:
@@ -1241,6 +1887,7 @@ def build_dashboard_content(
     objects: list = None,
     table_label: Optional[str] = None,
     pages: Optional[list] = None,
+    link_interactions: Optional[bool] = None,
 ) -> dict:
     """Build ONE SAS VA report containing multiple objects (KPIs + charts).
 
@@ -1273,6 +1920,7 @@ def build_dashboard_content(
     visuals: list = []
     units: list = []
     tile_pages: list = []
+    has_control = False
 
     for i, (page_idx, spec) in enumerate(flat):
         tile_pages.append(page_idx)
@@ -1281,6 +1929,47 @@ def build_dashboard_content(
         # Per-object DIGIT suffix (not a prefix) — see _namespace: BIRD element
         # names must start with their type code or the reportData query 400s.
         suffix = str(i)
+
+        # ── interactive control prompt (filters the page) ────────────────────
+        # type:'control' (with control_type) or directly 'dropdown' / 'button_bar'
+        # / 'checkbox_list'. build_control_data already emits suffixed names, so a
+        # control bypasses the _namespace step the data objects need.
+        ctl_kind = spec.get("control_type") if otype == "control" else otype
+        if ctl_kind and str(ctl_kind).lower().strip() in _CONTROL_TYPES:
+            ds_c, dd_c, prompt_c = build_control_data(
+                str(ctl_kind), cas_server, cas_library, cas_table,
+                category_column=spec.get("category_column"),
+                measure_column=spec.get("measure_column"),
+                category_label=spec.get("category_label"),
+                table_label=table_label, suffix=suffix)
+            all_data_sources.append(ds_c)
+            all_data_definitions.append(dd_c)
+            all_visual_elements.append(prompt_c)
+            visuals.append(_dash_visual(f"vi_obj{i}", prompt_c["name"]))
+            units.append(1)
+            has_control = True
+            continue
+
+        # ── crosstab with a row/column hierarchy (list-form roles) ───────────
+        # A crosstab tile that supplies row_categories / column_categories /
+        # measures (lists) drills via build_crosstab_data; the single-level
+        # crosstab still flows through the catalog branch below.
+        if otype == "crosstab" and (spec.get("row_categories")
+                                    or spec.get("column_categories")
+                                    or spec.get("measures")):
+            ds_x, dd_x, xt = build_crosstab_data(
+                cas_server, cas_library, cas_table,
+                row_categories=spec.get("row_categories"),
+                column_categories=spec.get("column_categories"),
+                measures=spec.get("measures"),
+                table_label=table_label, measure_format=spec.get("measure_format"),
+                suffix=suffix)
+            all_data_sources.append(ds_x)
+            all_data_definitions.append(dd_x)
+            all_visual_elements.append(xt)
+            visuals.append(_dash_visual(f"vi_obj{i}", xt["name"]))
+            units.append(3)
+            continue
 
         if otype in _CHART_TYPES:
             single = build_chart_content(
@@ -1307,6 +1996,10 @@ def build_dashboard_content(
                 calc_numerator=spec.get("calc_numerator"),
                 calc_denominator=spec.get("calc_denominator"),
                 calc_op=spec.get("calc_op", "div"),
+                calc_expression=spec.get("calc_expression"),
+                calc_label=spec.get("calc_label"),
+                calc_format=spec.get("calc_format"),
+                calc_user_repr=spec.get("calc_user_repr"),
             )
             units.append(3)
         elif otype in ("kpi", "key_value", "keyvalue"):
@@ -1355,6 +2048,10 @@ def build_dashboard_content(
                 "histogram, box_plot, word_cloud, crosstab, button_bar, list_control."
             )
 
+        # Optional per-tile data filters (apply before namespacing so the filter
+        # business items get suffixed along with the rest of the object).
+        apply_filters(single, spec.get("filters"))
+
         # The primary visual element is the first one the builder emitted (the
         # Graph for charts, the object for catalog objects). Record it BEFORE
         # namespacing, then reference its suffixed name in the layout.
@@ -1369,6 +2066,15 @@ def build_dashboard_content(
         all_data_definitions.extend(ns["dataDefinitions"])
         all_visual_elements.extend(ns["visualElements"])
         visuals.append(_dash_visual(f"vi_obj{i}", primary + suffix))
+
+    # Share one data source across same-table tiles so a control prompt filters
+    # its peers and (when requested) charts cross-filter each other. Controls are
+    # useless without it, so it is forced on whenever a control is present.
+    if link_interactions is None:
+        link_interactions = has_control
+    if link_interactions:
+        all_data_sources, _rename = _merge_data_sources(
+            all_data_sources, all_data_definitions)
 
     display_ds = all_data_sources[0]["name"] if all_data_sources else "ds1"
 

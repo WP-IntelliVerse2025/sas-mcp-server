@@ -12,6 +12,7 @@ depend on them. The shared :data:`logger` lives here as the lowest-level module
 without creating an import cycle.
 """
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -26,6 +27,42 @@ logger = get_logger(__name__)
 _CLIENT_TIMEOUT = 300.0
 
 JSONDict = dict[str, Any]
+
+# The Viya host can intermittently drop connections (proxy/keep-alive resets seen
+# as ConnectTimeout / "Server disconnected without sending a response"). A browser
+# hides these via connection reuse/retry; discrete API calls do not, which made
+# multi-step flows (e.g. score executions) fail spuriously. Retry such transient
+# transport errors. Connection-establishment errors are safe to retry on ANY
+# method; mid-request errors (read/protocol) are only retried for idempotent
+# methods so a non-idempotent POST is never silently duplicated.
+_CONNECT_RETRY_EXC = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+_IDEMPOTENT_RETRY_EXC = _CONNECT_RETRY_EXC + (
+    httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError,
+)
+_IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS"})
+
+
+class _RetryTransport(httpx.AsyncHTTPTransport):
+    """httpx transport that retries transient connection failures with backoff."""
+
+    def __init__(self, *args: Any, max_retries: int = 3, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._max_retries = max_retries
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        retry_exc = (_IDEMPOTENT_RETRY_EXC if request.method in _IDEMPOTENT_METHODS
+                     else _CONNECT_RETRY_EXC)
+        for attempt in range(self._max_retries + 1):
+            try:
+                return await super().handle_async_request(request)
+            except retry_exc as exc:
+                if attempt >= self._max_retries:
+                    raise
+                logger.warning("Transient Viya connection error (%s %s, attempt %d/%d): %s",
+                               request.method, request.url.path, attempt + 1,
+                               self._max_retries, type(exc).__name__)
+                await asyncio.sleep(0.5 * (attempt + 1))
+        raise RuntimeError("unreachable")  # pragma: no cover
 
 
 async def get_json(
@@ -90,12 +127,17 @@ async def delete_resource(url: str, client: httpx.AsyncClient) -> None:
 
 
 def make_client(token: str) -> httpx.AsyncClient:
-    """Create an :class:`httpx.AsyncClient` with auth headers for Viya API calls."""
+    """Create an :class:`httpx.AsyncClient` with auth headers for Viya API calls.
+
+    Uses a retrying transport so intermittent connection drops to the Viya host
+    are retried transparently instead of surfacing as tool failures.
+    """
     if not token.startswith("Bearer "):
         token = f"Bearer {token}"
     headers = {"Authorization": token}
+    transport = _RetryTransport(verify=SSL_VERIFY, max_retries=3)
     return httpx.AsyncClient(
-        headers=headers, verify=SSL_VERIFY, timeout=_CLIENT_TIMEOUT
+        headers=headers, timeout=_CLIENT_TIMEOUT, transport=transport
     )
 
 
