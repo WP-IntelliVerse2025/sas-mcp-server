@@ -9,6 +9,7 @@ Run with:  uv run python -m pytest -m integration
 """
 import base64
 import contextlib
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -460,10 +461,13 @@ async def test_report_workflow(integration_mcp_server):
         reports = (await client.call_tool("list_reports", {"limit": 5})).data
         assert isinstance(reports, list)
 
-        if not reports:
-            pytest.skip("No reports found on this Viya instance")
-
-        report_id = reports[0]["id"]
+        # Pin to TEST_REPORT_ID when set (deterministic CI); otherwise use the
+        # first report the instance returns.
+        report_id = os.getenv("TEST_REPORT_ID")
+        if not report_id:
+            if not reports:
+                pytest.skip("No reports found on this Viya instance")
+            report_id = reports[0]["id"]
         report = (await client.call_tool("get_report", {
             "report_id": report_id
         })).data
