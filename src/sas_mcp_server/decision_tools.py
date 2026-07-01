@@ -543,6 +543,12 @@ def register_decision_tools(
         conditional: str = "if", name: str = "rule",
     ) -> Any:
         conditions = conditions or []
+        # SAS Intelligent Decisioning rejects an unconditional 'else' rule that still
+        # carries conditions ("request body invalid" / intermittent 400). When the
+        # caller supplies conditions, the rule is really an 'elseif' — coerce it so a
+        # final catch-all tier (e.g. Budget when Price_Per_Unit < 1000) adds reliably.
+        if conditional == "else" and conditions:
+            conditional = "elseif"
         try:
             async with session("sas_add_rule", ctx) as client:
                 try:
@@ -673,6 +679,67 @@ def register_decision_tools(
                         "actions": [f"{(a.get('term') or {}).get('name')} = {a.get('expression')}"
                                     for a in (res.get("actions") or [])],
                         "rule_set_id": rule_set_id, "url": _dm_url("rules", rule_set_id)}
+        except Exception as e:
+            return _err(e)
+
+    @mcp.tool(
+        name="sas_delete_rule",
+        description=(
+            "Delete ONE rule from a business rule set, leaving the rest of the set "
+            "intact. Identify it with `rule_set_id` + `rule_id` (see sas_get_rule_set "
+            "for the rules and their ids). To remove the whole set use "
+            "sas_delete_rule_set. Returns a not_found status if no such rule."
+        ),
+    )
+    async def sas_delete_rule(rule_set_id: str, rule_id: str, ctx: Context) -> Any:
+        try:
+            async with session("sas_delete_rule", ctx) as client:
+                r = await client.delete(
+                    f"{VIYA_ENDPOINT}/businessRules/ruleSets/{rule_set_id}/rules/{rule_id}")
+                if r.status_code == 404:
+                    return {"status": "not_found",
+                            "rule_set_id": rule_set_id, "rule_id": rule_id}
+                r.raise_for_status()
+                return {"status": "deleted", "rule_set_id": rule_set_id, "rule_id": rule_id}
+        except Exception as e:
+            return _err(e)
+
+    @mcp.tool(
+        name="sas_reorder_rules",
+        description=(
+            "Set the execution order of the rules in a business rule set. Rules in a set "
+            "fire top-to-bottom, so order matters. Pass `rule_set_id` and `rule_ids` — "
+            "the rule ids in the exact order you want them evaluated (it must list every "
+            "rule in the set). See sas_get_rule_set for the current rules and their ids."
+        ),
+    )
+    async def sas_reorder_rules(
+        rule_set_id: str, rule_ids: list[str], ctx: Context
+    ) -> Any:
+        if not rule_ids:
+            return {"status": "invalid", "message": "Provide rule_ids in the desired order."}
+        try:
+            async with session("sas_reorder_rules", ctx) as client:
+                # The /order endpoint is an optimistic-concurrency write: it requires
+                # the rule set's current Last-Modified echoed back as If-Unmodified-Since.
+                g = await client.get(
+                    f"{VIYA_ENDPOINT}/businessRules/ruleSets/{rule_set_id}",
+                    headers={"Accept": _RS})
+                if g.status_code == 404:
+                    return {"status": "not_found", "rule_set_id": rule_set_id}
+                g.raise_for_status()
+                headers = {"Content-Type": "application/json", "Accept": "application/json"}
+                last_mod = g.headers.get("Last-Modified")
+                if last_mod:
+                    headers["If-Unmodified-Since"] = last_mod
+                r = await client.put(
+                    f"{VIYA_ENDPOINT}/businessRules/ruleSets/{rule_set_id}/order",
+                    json={"resources": list(rule_ids)}, headers=headers)
+                if r.status_code == 404:
+                    return {"status": "not_found", "rule_set_id": rule_set_id}
+                r.raise_for_status()
+                return {"status": "reordered", "rule_set_id": rule_set_id,
+                        "order": list(rule_ids)}
         except Exception as e:
             return _err(e)
 
@@ -1663,6 +1730,14 @@ def register_decision_tools(
                         "(activation step did not complete); activate it in SAS if needed."}
         except Exception as e:
             return _err(e)
+
+    # NOTE: a `sas_update_lookup_table` tool (edit an existing lookup's entries) was
+    # prototyped but NOT shipped. Live testing showed reference-data content cannot be
+    # cleanly edited in place — a production content rejects PATCH/demote (HTTP 400),
+    # and adding a parallel content leaves two "active" versions (ambiguous which the
+    # lookup uses). The captured UI HAR is a messy create+version session, not a clean
+    # edit, so a correct flow could not be verified. Use sas_create_lookup_table to
+    # (re)create a lookup; editing entries of an existing one needs a dedicated capture.
 
     # ── Custom REST node types (registered decision nodes) ─────────────────────
 

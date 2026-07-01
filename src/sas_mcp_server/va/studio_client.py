@@ -8,6 +8,7 @@ and flow_create_and_stored.har (SAS Program node flow save).
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -1017,12 +1018,25 @@ class SASStudioClient:
     ) -> str:
         """Render a PROC SQL step equivalent to a Studio Query flow."""
         col_types = col_types or {}
+        # A CAS caslib reference such as "CASUSER(yash)" (a personal-caslib display
+        # name) or a bare CAS caslib is not a usable SAS libref on its own. Assign
+        # it explicitly via libname so PROC SQL reads it on any session.
+        lib = (input_libref or "").strip()
+        base = re.sub(r"\(.*?\)", "", lib).strip()        # CASUSER(yash) -> CASUSER
+        cas_prefix = cas_clear = ""
+        if "(" in lib or base.upper() in ("CASUSER", "PUBLIC"):
+            caslib = "casuser" if base.upper() == "CASUSER" else base
+            lib = "_WPCAS"
+            cas_prefix = f'libname {lib} cas caslib="{caslib}";\n'
+            cas_clear = "\nlibname _WPCAS clear;"
+        else:
+            lib = base or lib
         sel = (", ".join(self._quote_sas_name(c) for c in selected_columns)
                if selected_columns else "*")
-        sql = (f"proc sql;\n"
+        sql = ("options validvarname=any;\n" + cas_prefix + f"proc sql;\n"
                f"  create table {output_libref}.{output_table} as\n"
                f"  select {sel}\n"
-               f"  from {input_libref}.{input_table}")
+               f"  from {lib}.{input_table}")
         clauses = [
             self._sql_filter_clause(
                 f["column"], f.get("operator", "equals"),
@@ -1038,7 +1052,7 @@ class SASStudioClient:
                 nm = self._quote_sas_name(s["column"])
                 order.append(nm if s.get("ascending", True) else nm + " desc")
             sql += "\n  order by " + ", ".join(order)
-        sql += ";\nquit;"
+        sql += ";\nquit;" + cas_clear
         return sql
 
     def run_query_via_sql(

@@ -371,7 +371,9 @@ def register_model_tools(
             "Create a SAS Model Manager project — the container that appears on "
             "the Projects screen. Defaults to the default repository. After "
             "creating it, add models with sas_model_copy_model_to_project (or use "
-            "sas_model_create_project_with_model to do both at once)."
+            "sas_model_create_project_with_model to do both at once). The result "
+            "includes a `url` field — ALWAYS share that exact url with the user; "
+            "never invent or guess a link host."
         ),
     )
     async def sas_model_create_project(
@@ -380,10 +382,17 @@ def register_model_tools(
         repository_id: str | None = None, folder_id: str | None = None,
     ) -> Any:
         try:
-            return await asyncio.to_thread(_w_create_project, await get_token(ctx), {
+            res = await asyncio.to_thread(_w_create_project, await get_token(ctx), {
                 "name": name, "function": function, "description": description,
                 "train_table": train_table, "target_variable": target_variable,
                 "repository_id": repository_id, "folder_id": folder_id})
+            # Return a real Model Manager URL so the model never invents a
+            # placeholder host (e.g. "your-sas-server-link"). The project is
+            # the newest in the Projects list (project routing is a client-side
+            # hash route, so we link to the app, not a deep path).
+            if isinstance(res, dict) and res.get("id"):
+                res["url"] = f"{VIYA_ENDPOINT}/SASModelManager/"
+            return res
         except Exception as e:
             return _err(e)
 

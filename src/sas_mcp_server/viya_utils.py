@@ -37,6 +37,13 @@ async def get_context_id(client: httpx.AsyncClient, context_name: str) -> str:
     items = coll.get("items", [])
     if not items:
         raise RuntimeError(f"Compute context not found: {context_name}")
+    # The ?name= filter isn't honored by /compute/contexts (it returns ALL
+    # contexts), so items[0] was "CAS Formats service compute context" — a
+    # service context that can't run user code (500 on session create). Match
+    # the requested name exactly; fall back to the first only if none match.
+    for it in items:
+        if it.get("name") == context_name:
+            return it["id"]
     return items[0]["id"]
 
 
